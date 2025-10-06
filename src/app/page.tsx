@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import InstallPWA from "./install-pwa";
 import dynamic from "next/dynamic";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { v4 as uuidv4 } from "uuid";
@@ -647,6 +648,7 @@ export default function App() {
               <Share2 className="h-4 w-4 mr-1" /> Invite
             </Button>
             <Button size="sm" variant="outline" onClick={() => exportCSV(list)}>Export CSV</Button>
+             <InstallPWA />
           </div>
         </div>
       </header>
