@@ -8,7 +8,6 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 export const metadata: Metadata = {
   title: "UFO & Drone Tracker",
   description: "Track UFO & drone sightings with your circle.",
-  manifest: "/manifest.json",              // ✅ tells Next to add <link rel="manifest">
   themeColor: "#0ea5e9",                   // ✅ adds <meta name="theme-color">
   icons: {
     icon: [
