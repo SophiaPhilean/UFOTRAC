@@ -525,19 +525,36 @@ export default function App() {
   }, [roomId, client]);
 
   async function createSighting(base: Partial<Sighting> | null, errMsg?: string) {
-    if (!base) return toast.error("Missing info", { description: errMsg || "Please fill required fields." });
-    const s = { ...(base as Sighting), room_id: roomId };
-    try {
-      await store.upsert(s);
-      recordSubmit();
-      toast.success("Sighting logged", { description: "Shared with your circle." });
-      reload();
-    } catch (e: any) {
-      console.error(e);
-      toast.error("Save failed", { description: String(e?.message || e) });
-    }
+  if (!base) {
+    return toast.error("Missing info", { description: errMsg || "Please fill required fields." });
   }
+  const s = { ...(base as Sighting), room_id: roomId };
 
+  try {
+    // save to local or Supabase (depending on your Settings)
+    await store.upsert(s);
+    recordSubmit();
+
+    // ✅ NEW: trigger email notifications (does not block the UI if it fails)
+    fetch("/api/notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        // this matches the simplified route.ts we created
+        title: s.title,
+        notes: s.notes,
+        room_id: roomId,
+      }),
+    }).catch(() => { /* ignore notify failures so save still succeeds */ });
+
+    // existing UI flow
+    toast.success("Sighting logged", { description: "Shared with your circle." });
+    reload();
+  } catch (e: any) {
+    console.error(e);
+    toast.error("Save failed", { description: String(e?.message || e) });
+  }
+}
   async function vote(id: string, delta: number) {
     try { await store.vote(id, delta); reload(); } catch { reload(); }
   }
