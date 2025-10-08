@@ -1,14 +1,15 @@
 // next.config.js
 const withPWA = require('next-pwa')({
   dest: 'public',
+  // Off in dev, ON in production (Vercel sets NODE_ENV=production)
   disable: process.env.NODE_ENV === 'development',
   register: true,
   skipWaiting: true,
-  // Only handle http(s) requests so we don't touch chrome-extension://
+  // Keep the SW from trying to cache browser extension URLs
   workboxOptions: {
-    // Ensure the SW doesn't try to cache extension requests
     runtimeCaching: [
       {
+        // Only handle http/https requests
         urlPattern: ({ url }) => url.protocol === 'http:' || url.protocol === 'https:',
         handler: 'NetworkFirst',
         options: {
@@ -17,7 +18,6 @@ const withPWA = require('next-pwa')({
         },
       },
     ],
-    // Be resilient
     clientsClaim: true,
     navigateFallbackDenylist: [/^\/_next\//],
   },
