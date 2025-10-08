@@ -119,16 +119,32 @@ function useSupabase() {
 
 // ---------------- Rooms ----------------
 function useRoom() {
-  const [roomId, setRoomId] = useState<string>(() => storage.get("ufo:room:id", uuidv4().slice(0, 8)));
-  const [roomName, setRoomName] = useState<string>(() => storage.get("ufo:room:name", "My UFO Circle"));
-  const [ownerEmail, setOwnerEmail] = useState<string>(() => storage.get("ufo:room:owner", ""));
-  const [adminCode, setAdminCode] = useState<string>(() => storage.get("ufo:room:code", ""));
-  useEffect(() => storage.set("ufo:room:id", roomId), [roomId]);
-  useEffect(() => storage.set("ufo:room:name", roomName), [roomName]);
-  useEffect(() => storage.set("ufo:room:owner", ownerEmail), [ownerEmail]);
-  useEffect(() => storage.set("ufo:room:code", adminCode), [adminCode]);
+  // Start empty to avoid SSR/client mismatch
+  const [roomId, setRoomId] = useState<string>("");
+  const [roomName, setRoomName] = useState<string>("");
+  const [ownerEmail, setOwnerEmail] = useState<string>("");
+  const [adminCode, setAdminCode] = useState<string>("");
+
+  // Hydrate from localStorage only on client
+  useEffect(() => {
+    const initialRoomId = storage.get("ufo:room:id", "") || uuidv4().slice(0, 8);
+    const initialRoomName = storage.get("ufo:room:name", "My UFO Circle");
+    const initialOwner = storage.get("ufo:room:owner", "");
+    const initialCode = storage.get("ufo:room:code", "");
+    setRoomId(initialRoomId);
+    setRoomName(initialRoomName);
+    setOwnerEmail(initialOwner);
+    setAdminCode(initialCode);
+  }, []);
+
+  useEffect(() => { if (roomId) storage.set("ufo:room:id", roomId); }, [roomId]);
+  useEffect(() => { if (roomName) storage.set("ufo:room:name", roomName); }, [roomName]);
+  useEffect(() => { storage.set("ufo:room:owner", ownerEmail); }, [ownerEmail]);
+  useEffect(() => { storage.set("ufo:room:code", adminCode); }, [adminCode]);
+
   return { roomId, setRoomId, roomName, setRoomName, ownerEmail, setOwnerEmail, adminCode, setAdminCode };
 }
+
 
 // ---------------- Local store (fallback) ----------------
 function useLocalSightings(roomId: string) {
@@ -269,7 +285,11 @@ function SightingForm({ onSubmit, uploadMedia, requireAuth, isAuthed }: Sighting
   const [vehicleMake, setVehicleMake] = useState("");
   const [vehicleModel, setVehicleModel] = useState("");
   const [vehicleColor, setVehicleColor] = useState("");
-  const [whenISO, setWhenISO] = useState(() => new Date().toISOString().slice(0, 16));
+  const [whenISO, setWhenISO] = useState("");
+useEffect(() => {
+  setWhenISO(new Date().toISOString().slice(0, 16));
+}, []);
+
   const [coords, setCoords] = useState<[number, number] | null>(null);
   const [address, setAddress] = useState("");
   const [media, setMedia] = useState("");
@@ -736,7 +756,7 @@ export default function App() {
             <span className="text-2xl">🛸</span>
             <div>
               <div className="text-xl font-semibold">{roomName}</div>
-              <div className="text-xs text-muted-foreground">Room ID: {roomId}</div>
+             <div className="text-xs text-muted-foreground">Room ID: {roomId || "…"}</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
