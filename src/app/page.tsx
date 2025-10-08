@@ -644,7 +644,13 @@ function exportCSV(rows: Sighting[]) {
 }
 
 // ---------------- Main App ----------------
+// ---------------- Main App ----------------
 export default function App() {
+  // ✅ Prevent hydration mismatches: render only after client mount
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  if (!mounted) return null;
+
   const { url, key, setUrl, setKey, client, user } = useSupabase();
   const { roomId, setRoomId, roomName, setRoomName, ownerEmail, setOwnerEmail, adminCode, setAdminCode } = useRoom();
   const [requireAuth, setRequireAuth] = useState<boolean>(() => storage.get("ufo:room:reqauth", false));
@@ -652,22 +658,23 @@ export default function App() {
 
   const localStore = useLocalSightings(roomId);
   const remoteStore = useRemoteSightings(client, roomId, () => reload());
-  const store = (remoteStore as any) || localStore;
+  const store: any = remoteStore || localStore;
 
   const [list, setList] = useState<Sighting[]>([]);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState("map");
   const [inviteUrl, setInviteUrl] = useState("");
 
+  // Build invite link on client
   useEffect(() => {
-    // hydrate invite URL on the client
+    if (!roomId) return;
     const u = new URL(window.location.href);
     u.searchParams.set("room", roomId);
     setInviteUrl(u.toString());
   }, [roomId]);
 
+  // Join via ?room= param
   useEffect(() => {
-    // read ?room= from URL (join links)
     const params = new URLSearchParams(window.location.search);
     const r = params.get("room");
     if (r) setRoomId(r);
@@ -686,7 +693,9 @@ export default function App() {
     }
   }
 
+  // Initial load + realtime subscription (when remote available)
   useEffect(() => {
+    if (!roomId) return;
     reload();
     if (remoteStore?.subscribe) {
       const unsub = remoteStore.subscribe();
@@ -702,7 +711,7 @@ export default function App() {
       await store.upsert(s);
       recordSubmit();
 
-      // Fire-and-forget: email notifications to members of this room
+      // Fire-and-forget: notify members by email (handled by /api/notify)
       fetch("/api/notify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -755,8 +764,8 @@ export default function App() {
           <div className="flex items-center gap-3">
             <span className="text-2xl">🛸</span>
             <div>
-              <div className="text-xl font-semibold">{roomName}</div>
-             <div className="text-xs text-muted-foreground">Room ID: {roomId || "…"}</div>
+              <div className="text-xl font-semibold">{roomName || "…"}</div>
+              <div className="text-xs text-muted-foreground">Room ID: {roomId || "…"}</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -858,6 +867,7 @@ export default function App() {
             <Button
               size="sm"
               onClick={async () => {
+                if (!inviteUrl) return;
                 await navigator.clipboard.writeText(inviteUrl);
                 toast.success("Invite copied", { description: "Share this link so friends join your circle." });
               }}
