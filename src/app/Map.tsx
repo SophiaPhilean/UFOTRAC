@@ -2,50 +2,57 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-/**
- * Props:
- *   list: [{ id, lat, lng }]
- *   onPick?: (lat, lng) => void
- */
+type SightingLite = {
+  id: string;
+  lat: number;
+  lng: number;
+  title?: string;
+  when_iso?: string; // ISO UTC
+  user_name?: string;
+  shape?: string;
+  color?: string;
+  car_make?: string | null;
+  car_model?: string | null;
+  car_color?: string | null;
+};
+
 export default function SightingsMap({
   list,
   onPick,
 }: {
-  list: Array<{ id: string; lat: number; lng: number }>;
+  list: SightingLite[];
   onPick?: (lat: number, lng: number) => void;
 }) {
-  // --- Hooks must be at top; no early returns before these ---
   const [mounted, setMounted] = useState(false);
-  const [Leaflet, setLeaflet] = useState<{
+  const [leaflet, setLeaflet] = useState<{
     L: any;
     RL: {
-      MapContainer: any;
-      TileLayer: any;
-      Marker: any;
-      Popup: any;
-      useMapEvents: any;
+      MapContainer: React.ComponentType<any>;
+      TileLayer: React.ComponentType<any>;
+      Marker: React.ComponentType<any>;
+      Popup: React.ComponentType<any>;
+      useMapEvents: (arg: { click?: (e: any) => void }) => void;
     };
   } | null>(null);
+
   const mapRef = useRef<any>(null);
 
-  // center can be memoized safely (doesn't depend on Leaflet)
   const center = useMemo<[number, number]>(() => {
-    if (!list?.length) return [39, -98]; // US-ish centroid fallback
+    if (!list?.length) return [39, -98];
     return [list[0].lat, list[0].lng];
   }, [list]);
 
   useEffect(() => {
     setMounted(true);
     (async () => {
-      // Load CSS and libs client-side only
       await import("leaflet/dist/leaflet.css");
-      const L = await import("leaflet");
-      const RL = await import("react-leaflet");
+      const Lmod = await import("leaflet");
+      const RLmod = await import("react-leaflet");
 
-      // Fix default icon paths (optional)
-      const icon = (L as any).Icon.Default;
-      if (icon && icon.prototype) {
-        icon.mergeOptions?.({
+      const L = (Lmod as any).default || Lmod;
+      const icon = L.Icon?.Default;
+      if (icon && icon.prototype && icon.mergeOptions) {
+        icon.mergeOptions({
           iconRetinaUrl:
             "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
           iconUrl:
@@ -54,12 +61,15 @@ export default function SightingsMap({
             "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
         });
       }
-      setLeaflet({ L: (L as any).default || L, RL: RL as any });
+
+      setLeaflet({
+        L,
+        RL: RLmod as any,
+      });
     })();
   }, []);
 
-  // ❗️Only now is it safe to early-return
-  if (!mounted || !Leaflet) {
+  if (!mounted || !leaflet) {
     return (
       <div className="h-[420px] rounded-2xl border grid place-items-center text-sm text-muted-foreground">
         Loading map…
@@ -67,18 +77,16 @@ export default function SightingsMap({
     );
   }
 
-  const { L, RL } = Leaflet;
+  const { L, RL } = leaflet;
   const { MapContainer, TileLayer, Marker, Popup, useMapEvents } = RL;
 
-  // Helper (not a hook) – only called during render after Leaflet is loaded
-  const getIcon = (emoji = "🛸", bg = "bg-black/80") =>
+  const getIcon = (emoji = "🛸") =>
     L.divIcon({
-      html: `<div class="rounded-full p-1 ${bg} text-white text-xs">${emoji}</div>`,
+      html: `<div class="rounded-full p-1 bg-black/80 text-white text-xs">${emoji}</div>`,
       iconSize: [24, 24],
       className: "",
     });
 
-  // Inner component to wire clicks to parent
   function Clicker() {
     useMapEvents({
       click(e: any) {
@@ -87,6 +95,33 @@ export default function SightingsMap({
     });
     return null;
   }
+
+  const iconFor = (s: SightingLite) => {
+    if ((s.shape || "").toLowerCase() === "triangle") return getIcon("🔺");
+    if ((s.shape || "").toLowerCase() === "cigar") return getIcon("🚬");
+    if ((s.shape || "").toLowerCase() === "disc") return getIcon("💿");
+    if ((s.shape || "").toLowerCase() === "lights") return getIcon("✨");
+    if ((s.car_make || s.car_model)) return getIcon("🚗");
+    if ((s.color || "").toLowerCase() === "red") return getIcon("🔴");
+    if ((s.color || "").toLowerCase() === "blue") return getIcon("🔵");
+    if ((s.color || "").toLowerCase() === "green") return getIcon("🟢");
+    if ((s.color || "").toLowerCase() === "orange") return getIcon("🟠");
+    return getIcon("🛸");
+  };
+
+  const formatLocal = (iso?: string) => {
+    if (!iso) return "";
+    try {
+      return new Date(iso).toLocaleString();
+    } catch {
+      return iso;
+    }
+  };
+
+  const vehicleLine = (s: SightingLite) => {
+    const parts = [s.car_make, s.car_model, s.car_color].filter(Boolean);
+    return parts.length ? `Vehicle: ${parts.join(" • ")}` : "";
+    };
 
   return (
     <div className="h-[420px] rounded-2xl overflow-hidden">
@@ -100,20 +135,29 @@ export default function SightingsMap({
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
+
         {list?.map((s) => (
-          <Marker
-            key={s.id}
-            position={[s.lat, s.lng] as any}
-            icon={getIcon()}
-          >
+          <Marker key={s.id} position={[s.lat, s.lng] as any} icon={iconFor(s)}>
             <Popup>
               <div className="space-y-1">
-                <div className="text-sm">Lat {s.lat.toFixed(3)}</div>
-                <div className="text-sm">Lng {s.lng.toFixed(3)}</div>
+                {s.title && <div className="font-medium">{s.title}</div>}
+                {s.when_iso && (
+                  <div className="text-xs text-muted-foreground">
+                    {formatLocal(s.when_iso)}
+                  </div>
+                )}
+                {(s.shape || s.color) && (
+                  <div className="text-sm">
+                    {[s.shape, s.color].filter(Boolean).join(" • ")}
+                  </div>
+                )}
+                {vehicleLine(s) && <div className="text-sm">{vehicleLine(s)}</div>}
+                {s.user_name && <div className="text-sm">By {s.user_name}</div>}
               </div>
             </Popup>
           </Marker>
         ))}
+
         <Clicker />
       </MapContainer>
     </div>
