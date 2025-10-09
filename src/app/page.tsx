@@ -642,15 +642,14 @@ function exportCSV(rows: Sighting[]) {
   a.click();
   URL.revokeObjectURL(url);
 }
-
-// ---------------- Main App ----------------
 // ---------------- Main App ----------------
 export default function App() {
-  // ✅ Prevent hydration mismatches: render only after client mount
+  // 1) Mount guard to avoid hydration mismatches
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
-  if (!mounted) return null;
+  // NOTE: We do NOT return yet; we declare all hooks first.
 
+  // 2) All hooks must be declared in the same order, every render
   const { url, key, setUrl, setKey, client, user } = useSupabase();
   const { roomId, setRoomId, roomName, setRoomName, ownerEmail, setOwnerEmail, adminCode, setAdminCode } = useRoom();
   const [requireAuth, setRequireAuth] = useState<boolean>(() => storage.get("ufo:room:reqauth", false));
@@ -658,7 +657,14 @@ export default function App() {
 
   const localStore = useLocalSightings(roomId);
   const remoteStore = useRemoteSightings(client, roomId, () => reload());
-  const store: any = remoteStore || localStore;
+  const store: {
+    list: () => Promise<Sighting[]>;
+    upsert: (s: Sighting) => Promise<any>;
+    remove: (id: string) => Promise<any>;
+    vote: (id: string, delta: number) => Promise<any>;
+    uploadMedia?: (file: File, room: string) => Promise<string>;
+    subscribe?: () => () => void;
+  } = (remoteStore as any) || (localStore as any);
 
   const [list, setList] = useState<Sighting[]>([]);
   const [loading, setLoading] = useState(false);
@@ -667,14 +673,15 @@ export default function App() {
 
   // Build invite link on client
   useEffect(() => {
-    if (!roomId) return;
+    if (!roomId || typeof window === "undefined") return;
     const u = new URL(window.location.href);
     u.searchParams.set("room", roomId);
     setInviteUrl(u.toString());
   }, [roomId]);
 
-  // Join via ?room= param
+  // Join via ?room= param (client only)
   useEffect(() => {
+    if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
     const r = params.get("room");
     if (r) setRoomId(r);
@@ -685,9 +692,9 @@ export default function App() {
     try {
       const rows = await store.list();
       setList(rows as Sighting[]);
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error(e);
-      toast.error("Load failed", { description: String(e?.message || e) });
+      toast.error("Load failed", { description: String((e as any)?.message || e) });
     } finally {
       setLoading(false);
     }
@@ -715,18 +722,14 @@ export default function App() {
       fetch("/api/notify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: s.title,
-          notes: s.notes,
-          room_id: roomId,
-        }),
+        body: JSON.stringify({ title: s.title, notes: s.notes, room_id: roomId }),
       }).catch(() => {});
 
       toast.success("Sighting logged", { description: "Shared with your circle." });
       reload();
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error(e);
-      toast.error("Save failed", { description: String(e?.message || e) });
+      toast.error("Save failed", { description: String((e as any)?.message || e) });
     }
   }
 
@@ -752,10 +755,13 @@ export default function App() {
     try {
       await store.remove(id);
       reload();
-    } catch (e: any) {
-      toast.error("Delete failed", { description: String(e?.message || e) });
+    } catch (e: unknown) {
+      toast.error("Delete failed", { description: String((e as any)?.message || e) });
     }
   }
+
+  // ❗️Only now is it safe to early-return using the mounted guard
+  if (!mounted) return null;
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white">
@@ -771,14 +777,10 @@ export default function App() {
           <div className="flex items-center gap-2">
             <Dialog>
               <DialogTrigger asChild>
-                <Button variant="secondary" size="sm">
-                  <Settings className="h-4 w-4 mr-1" /> Settings
-                </Button>
+                <Button variant="secondary" size="sm"><Settings className="h-4 w-4 mr-1" /> Settings</Button>
               </DialogTrigger>
               <DialogContent className="sm:max-w-xl">
-                <DialogHeader>
-                  <DialogTitle>Circle, Auth & Backend</DialogTitle>
-                </DialogHeader>
+                <DialogHeader><DialogTitle>Circle, Auth & Backend</DialogTitle></DialogHeader>
 
                 <div className="space-y-4">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -790,15 +792,7 @@ export default function App() {
                       <Label>Room ID</Label>
                       <div className="flex gap-2">
                         <Input value={roomId} onChange={(e) => setRoomId(e.target.value.trim())} />
-                        <Button
-                          variant="outline"
-                          onClick={() => {
-                            const r = uuidv4().slice(0, 8);
-                            setRoomId(r);
-                          }}
-                        >
-                          New
-                        </Button>
+                        <Button variant="outline" onClick={() => setRoomId(uuidv4().slice(0, 8))}>New</Button>
                       </div>
                     </div>
                   </div>
@@ -806,14 +800,8 @@ export default function App() {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     <div>
                       <Label>Owner email (optional)</Label>
-                      <Input
-                        value={ownerEmail}
-                        onChange={(e) => setOwnerEmail(e.target.value)}
-                        placeholder="owner@you.com"
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">
-                        If set, that signed-in user bypasses admin code for deletes.
-                      </p>
+                      <Input value={ownerEmail} onChange={(e) => setOwnerEmail(e.target.value)} placeholder="owner@you.com" />
+                      <p className="text-xs text-muted-foreground mt-1">If set, that signed-in user bypasses admin code for deletes.</p>
                     </div>
                     <div>
                       <Label>Admin code (optional)</Label>
@@ -825,12 +813,7 @@ export default function App() {
                     <div className="font-medium">Auth (Supabase magic link)</div>
                     <AuthControls client={client} />
                     <div className="flex items-center gap-3 mt-2">
-                      <input
-                        type="checkbox"
-                        id="req"
-                        checked={requireAuth}
-                        onChange={(e) => setRequireAuth(e.target.checked)}
-                      />
+                      <input type="checkbox" id="req" checked={requireAuth} onChange={(e) => setRequireAuth(e.target.checked)} />
                       <Label htmlFor="req">Require sign-in to post</Label>
                     </div>
                   </div>
@@ -840,44 +823,26 @@ export default function App() {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                       <div>
                         <Label>Supabase URL</Label>
-                        <Input
-                          value={url}
-                          onChange={(e) => setUrl(e.target.value)}
-                          placeholder="https://YOUR-PROJECT.supabase.co"
-                        />
+                        <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://YOUR-PROJECT.supabase.co" />
                       </div>
                       <div>
                         <Label>Anon key</Label>
-                        <Input
-                          value={key}
-                          onChange={(e) => setKey(e.target.value)}
-                          placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…"
-                        />
+                        <Input value={key} onChange={(e) => setKey(e.target.value)} placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…" />
                       </div>
                     </div>
                     <p className="text-xs text-muted-foreground mt-2">
-                      Leave blank to use private, device-only storage. Fill both fields to enable cloud sync and multi-user rooms. Storage
-                      bucket name expected: <code>media</code>.
+                      Leave blank to use private, device-only storage. Fill both fields to enable cloud sync and multi-user rooms. Storage bucket name expected: <code>media</code>.
                     </p>
                   </div>
                 </div>
               </DialogContent>
             </Dialog>
 
-            <Button
-              size="sm"
-              onClick={async () => {
-                if (!inviteUrl) return;
-                await navigator.clipboard.writeText(inviteUrl);
-                toast.success("Invite copied", { description: "Share this link so friends join your circle." });
-              }}
-            >
+            <Button size="sm" onClick={async () => { if (!inviteUrl) return; await navigator.clipboard.writeText(inviteUrl); toast.success("Invite copied", { description: "Share this link so friends join your circle." }); }}>
               <Share2 className="h-4 w-4 mr-1" /> Invite
             </Button>
 
-            <Button size="sm" variant="outline" onClick={() => exportCSV(list)}>
-              Export CSV
-            </Button>
+            <Button size="sm" variant="outline" onClick={() => exportCSV(list)}>Export CSV</Button>
           </div>
         </div>
       </header>
@@ -892,23 +857,17 @@ export default function App() {
 
           <TabsContent value="map" className="mt-4">
             <Card>
-              <CardHeader>
-                <CardTitle>Map of Sightings</CardTitle>
-              </CardHeader>
+              <CardHeader><CardTitle>Map of Sightings</CardTitle></CardHeader>
               <CardContent className="space-y-4">
                 <SightingsMap list={list} />
-                <div className="text-xs text-muted-foreground">
-                  Showing {list.length} sightings. {loading ? "Refreshing…" : ""}
-                </div>
+                <div className="text-xs text-muted-foreground">Showing {list.length} sightings. {loading ? "Refreshing…" : ""}</div>
               </CardContent>
             </Card>
           </TabsContent>
 
           <TabsContent value="list" className="mt-4">
             <div className="grid md:grid-cols-2 gap-4">
-              {list.map((s) => (
-                <SightingItem key={s.id} s={s} onVote={vote} onDelete={remove} />
-              ))}
+              {list.map((s) => <SightingItem key={s.id} s={s} onVote={vote} onDelete={remove} />)}
               {!list.length && (
                 <Card className="col-span-full">
                   <CardContent className="py-12 text-center text-muted-foreground">
