@@ -47,9 +47,9 @@ type Sighting = {
   upvotes: number;
   shape?: string;
   color?: string;
-  // vehicle (optional columns in your DB)
   car_make?: string | null;
   car_model?: string | null;
+  address_text?: string | null; // <-- NEW
 };
 
 type Member = {
@@ -82,7 +82,7 @@ const storage = {
   },
 };
 
-// datetime-local helper (local time, not UTC)
+// datetime-local helper (local time)
 function localInputNow() {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -92,10 +92,6 @@ function localInputNow() {
   const hh = pad(d.getHours());
   const mi = pad(d.getMinutes());
   return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
-}
-
-function nl<T>(v: T | undefined | null, alt = ""): T | string {
-  return v == null ? alt : (v as any);
 }
 
 /* ===========================
@@ -281,7 +277,7 @@ function useRemoteSightings(
 }
 
 /* ===========================
-   CSV export
+   CSV export (includes address_text)
 =========================== */
 function exportCSV(rows: Sighting[]) {
   const headers = [
@@ -299,11 +295,13 @@ function exportCSV(rows: Sighting[]) {
     "color",
     "car_make",
     "car_model",
+    "address_text", // <-- NEW
   ];
   const body = rows.map(r =>
-    headers.map(h =>
-      r as any && (r as any)[h] != null ? String((r as any)[h]).replaceAll('"', '""') : ""
-    )
+    headers.map(h => {
+      const v = (r as any)[h];
+      return v != null ? String(v).replaceAll('"', '""') : "";
+    })
   );
   const csv = [headers.join(","), ...body.map(r => `"${r.join('","')}"`)].join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
@@ -316,7 +314,7 @@ function exportCSV(rows: Sighting[]) {
 }
 
 /* ===========================
-   Simple components
+   UI pieces
 =========================== */
 function SightingItem({
   s,
@@ -352,6 +350,13 @@ function SightingItem({
         </div>
         <div className="text-sm text-muted-foreground">
           By {s.user_name} • ({s.lat.toFixed(3)}, {s.lng.toFixed(3)})
+          {s.address_text ? <> • {s.address_text}</> : null}
+          {s.car_make || s.car_model ? (
+            <>
+              {" "}
+              • Vehicle: {[s.car_make, s.car_model].filter(Boolean).join(" ")}
+            </>
+          ) : null}
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -376,13 +381,16 @@ function SightingItem({
               ▼ Downvote
             </Button>
           </div>
-          <Badge>{nl(s.upvotes, 0)} points</Badge>
+          <Badge>{s.upvotes ?? 0} points</Badge>
         </div>
       </CardContent>
     </Card>
   );
 }
 
+/* ===========================
+   SightingForm (with address_text)
+=========================== */
 function SightingForm({
   onSubmit,
   uploadMedia,
@@ -394,6 +402,7 @@ function SightingForm({
   requireAuth: boolean;
   isAuthed: boolean;
 }) {
+  // core fields
   const [title, setTitle] = useState("");
   const [notes, setNotes] = useState("");
   const [shape, setShape] = useState("");
@@ -402,13 +411,45 @@ function SightingForm({
   const [carModel, setCarModel] = useState("");
   const [reportAnon, setReportAnon] = useState(false);
 
+  // time + location
   const [whenISO, setWhenISO] = useState(localInputNow);
   const [coords, setCoords] = useState<[number, number] | null>(null);
+  const [address, setAddress] = useState("");
+
+  // media
   const [media, setMedia] = useState("");
   const [file, setFile] = useState<File | null>(null);
-  const [name, setName] = useState(() => storage.get("ufo:user:name", ""));
 
+  // name
+  const [name, setName] = useState(() => storage.get("ufo:user:name", ""));
   useEffect(() => storage.set("ufo:user:name", name), [name]);
+
+  async function geocodeAddress(q: string) {
+    if (!q.trim()) {
+      toast.error("Enter an address or place to search.");
+      return;
+    }
+    try {
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}`;
+      const res = await fetch(url, {
+        headers: { "Accept-Language": "en-US,en;q=0.9" },
+      });
+      if (!res.ok) throw new Error(`Geocode failed (${res.status})`);
+      const data: Array<{ lat: string; lon: string; display_name: string }> = await res.json();
+      if (!data.length) {
+        toast.error("No matches found for that address/place.");
+        return;
+      }
+      const best = data[0];
+      const lat = parseFloat(best.lat);
+      const lng = parseFloat(best.lon);
+      setCoords([lat, lng]);
+      setAddress(best.display_name); // keep pretty label as address_text
+      toast.success("Location set from address", { description: best.display_name });
+    } catch (e: any) {
+      toast.error("Address lookup failed", { description: e?.message || String(e) });
+    }
+  }
 
   return (
     <Card className="shadow-lg">
@@ -422,6 +463,7 @@ function SightingForm({
           </div>
         )}
 
+        {/* Basics */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
             <div className="flex items-center justify-between">
@@ -509,6 +551,7 @@ function SightingForm({
             />
           </div>
 
+          {/* Notes */}
           <div className="md:col-span-2">
             <Label>Notes</Label>
             <Textarea
@@ -519,6 +562,7 @@ function SightingForm({
             />
           </div>
 
+          {/* Media */}
           <div>
             <Label>Photo / video URL (optional)</Label>
             <Input value={media} onChange={e => setMedia(e.target.value)} placeholder="https://…" />
@@ -534,19 +578,36 @@ function SightingForm({
           </div>
         </div>
 
-        <div className="space-y-2">
+        {/* Location */}
+        <div className="space-y-3">
           <div className="flex items-center justify-between">
             <Label>Location</Label>
-            <span className="text-xs text-muted-foreground">Click the map to set coordinates</span>
+            <span className="text-xs text-muted-foreground">Use the address box or click the map</span>
           </div>
+
+          <div className="flex gap-2">
+            <Input
+              value={address}
+              onChange={e => setAddress(e.target.value)}
+              placeholder="e.g., Post Office, Glen Cove, NY"
+              className="flex-1"
+            />
+            <Button type="button" variant="outline" onClick={() => geocodeAddress(address)}>
+              Use address
+            </Button>
+          </div>
+
           <LocationPicker value={coords} onChange={setCoords} />
+
           {coords && (
             <div className="text-sm text-muted-foreground">
               Lat {coords[0].toFixed(5)}, Lng {coords[1].toFixed(5)}
+              {address ? <> • {address}</> : null}
             </div>
           )}
         </div>
 
+        {/* Actions */}
         <div className="flex justify-end gap-2">
           <Button
             variant="secondary"
@@ -555,11 +616,13 @@ function SightingForm({
               setNotes("");
               setMedia("");
               setCoords(null);
+              setAddress("");
               setShape("");
               setColor("");
               setCarMake("");
               setCarModel("");
               setFile(null);
+              setReportAnon(false);
               setWhenISO(localInputNow());
             }}
           >
@@ -568,12 +631,23 @@ function SightingForm({
 
           <Button
             onClick={async () => {
-              if (!title || !whenISO || !coords) {
+              if (!title || !whenISO) {
+                return onSubmit(null, "Please provide a title and time.");
+              }
+
+              // If user entered an address but hasn’t clicked the map yet, try geocoding on submit
+              if (!coords && address.trim()) {
+                await geocodeAddress(address);
+                if (!coords) return; // geocode failed; toast already shown
+              }
+
+              if (!coords) {
                 return onSubmit(
                   null,
-                  "Please provide a title, time, and click the map to set a location."
+                  "Please set a location: enter an address (Use address) or click the map."
                 );
               }
+
               let mediaUrl = media || "";
               if (!mediaUrl && file && uploadMedia) {
                 try {
@@ -582,9 +656,10 @@ function SightingForm({
                   return onSubmit(null, "Upload failed: " + (e?.message || String(e)));
                 }
               }
+
               onSubmit({
                 id: uuidv4(),
-                room_id: "", // filled by parent
+                room_id: "", // parent sets
                 user_name: reportAnon ? "Anonymous" : name || "Anonymous",
                 title,
                 notes,
@@ -597,6 +672,7 @@ function SightingForm({
                 color,
                 car_make: carMake || null,
                 car_model: carModel || null,
+                address_text: address || null, // <-- NEW
               });
             }}
           >
@@ -635,7 +711,6 @@ export default function App() {
 
   const [list, setList] = useState<Sighting[]>([]);
   const [loading, setLoading] = useState(false);
-  const [member, setMember] = useState<Member | null>(null);
   const [tab, setTab] = useState("map");
 
   async function reload() {
@@ -650,44 +725,6 @@ export default function App() {
       setLoading(false);
     }
   }
-
-  // ---- Member lookup (robust) ----
-  async function loadMember() {
-    if (!client || !user?.email) {
-      setMember(null);
-      return;
-    }
-    try {
-      const { data, error } = await client
-        .from("members")
-        .select("*")
-        .eq("email", user.email)
-        .eq("room_id", roomId)
-        .maybeSingle();
-
-      // Ignore "no rows" code; report real errors
-      if (error && (error as any).code !== "PGRST116") {
-        console.error("Member lookup error:", error);
-        toast.error("Member lookup failed", {
-          description: (error as any)?.message ?? String(error),
-        });
-        setMember(null);
-        return;
-      }
-      setMember((data as Member) || null);
-    } catch (err: any) {
-      console.error("Member lookup threw:", err);
-      toast.error("Member lookup failed", { description: err?.message ?? String(err) });
-      setMember(null);
-    }
-  }
-
-  // call once deps are ready
-  useEffect(() => {
-    if (!client) return;
-    loadMember();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, roomId, user?.email]);
 
   useEffect(() => {
     reload();
@@ -714,7 +751,15 @@ export default function App() {
         await fetch("/api/notify", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: s.title, notes: s.notes || "", room_id: s.room_id }),
+          body: JSON.stringify({
+            title: s.title,
+            notes: s.notes || "",
+            room_id: s.room_id,
+            address_text: s.address_text || "",
+            lat: s.lat,
+            lng: s.lng,
+            when_iso: s.when_iso,
+          }),
         });
       } catch {}
     } catch (e: any) {
@@ -733,7 +778,7 @@ export default function App() {
   }
 
   async function remove(id: string) {
-    // owner or admin code
+    // basic delete guard via owner/admin code (unchanged)
     if (user?.email && ownerEmail && user.email === ownerEmail) {
       // ok
     } else if (adminCode) {
