@@ -32,12 +32,7 @@ type Sighting = {
   vehicle_model: string | null;
   created_by: string | null;
   photo_url: string | null;
-  color: string | null;
-  altitude: string | null;
-  speed: string | null;
-  direction: string | null;
-  witnesses: number | null;
-  uap_type: string | null;
+  address_text: string | null;
   created_at: string;
   updated_at: string | null;
 };
@@ -69,15 +64,29 @@ function downloadCSV(filename: string, rows: Record<string, any>[]) {
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
 }
+/** Remove quotes/odd chars from ids and filenames for storage paths */
+function cleanId(s: string) { return (s || '').trim().replace(/["'`]/g, ''); }
+function cleanFileName(name: string) { return name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, ''); }
+/** Format ISO → value accepted by <input type="datetime-local"> in LOCAL time */
+function toLocalInputValue(iso?: string | null) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+const mapStateKey = (roomId: string) => `ufo:map:${roomId}`;
 
 /* ---------- Leaflet (CDN) ---------- */
 declare global { interface Window { L?: any; __leafletLoading?: boolean; __leafletReady?: boolean; } }
 async function loadLeaflet(): Promise<typeof window.L> {
   if (typeof window === 'undefined') throw new Error('SSR');
   if (window.L && window.__leafletReady) return window.L;
-  if (window.__leafletLoading) return new Promise(res => {
-    const t = setInterval(() => { if (window.L && window.__leafletReady) { clearInterval(t); res(window.L); } }, 50);
-  });
+  if (window.__leafletLoading) {
+    return new Promise(res => {
+      const t = setInterval(() => { if (window.L && window.__leafletReady) { clearInterval(t); res(window.L); } }, 50);
+    });
+  }
   window.__leafletLoading = true;
   const link = document.createElement('link'); link.rel = 'stylesheet'; link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'; document.head.appendChild(link);
   await new Promise<void>(r => { const s = document.createElement('script'); s.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'; s.async = true; s.onload = () => r(); document.body.appendChild(s); });
@@ -90,47 +99,68 @@ export default function ClientPage() {
   const { roomId, setRoomId, roomName, setRoomName, ownerEmail, setOwnerEmail, adminCode, setAdminCode } = useRoom();
   const localStore = useLocalSightings(roomId);
 
+  // Hydration guard to avoid SSR/Client mismatch
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => { setHydrated(true); }, []);
+
   // UI state
   const [activeTab, setActiveTab] = useState<'list'|'map'|'compose'|'settings'>('list');
   const [requireAuth, setRequireAuth] = useState<boolean>(() => storage.get('ufo:reqauth', false));
   useEffect(() => storage.set('ufo:reqauth', requireAuth), [requireAuth]);
 
-  // auth state
-  const [sessionEmail, setSessionEmail] = useState<string>(''); const [authLoading, setAuthLoading] = useState(false);
+  // auth
+  const [sessionEmail, setSessionEmail] = useState<string>(''); 
+  const [authLoading, setAuthLoading] = useState(false);
   useEffect(() => {
     const sub = supabase.auth.onAuthStateChange((_e, s) => setSessionEmail(s?.user?.email ?? ''));
     supabase.auth.getUser().then(({ data }) => setSessionEmail(data.user?.email ?? ''));
     return () => { try { sub.data.subscription.unsubscribe(); } catch {} };
   }, [supabase]);
 
-  const isSignedIn = !!user; const canPost = !requireAuth || isSignedIn; const isAdmin = !!adminCode && adminCode.length >= 4;
+  const isSignedIn = !!user; 
+  const canPost = !requireAuth || isSignedIn; 
+  const isAdmin = !!adminCode && adminCode.length >= 4;
 
   // filters/sort
-  const [q, setQ] = useState(''); const [stateFilter, setStateFilter] = useState(''); const [fromDate, setFromDate] = useState(''); const [toDate, setToDate] = useState('');
+  const [q, setQ] = useState(''); 
+  const [stateFilter, setStateFilter] = useState(''); 
+  const [fromDate, setFromDate] = useState(''); 
+  const [toDate, setToDate] = useState('');
   const [sort, setSort] = useState<'new'|'old'>('new');
 
   // data
-  const [sightings, setSightings] = useState<Sighting[]>([]); const [loading, setLoading] = useState(false); const [isPending, startTransition] = useTransition();
+  const [sightings, setSightings] = useState<Sighting[]>([]); 
+  const [loading, setLoading] = useState(false); 
+  const [isPending, startTransition] = useTransition();
   const [selectedId, setSelectedId] = useState<string|null>(null);
 
-  // form/editing (includes photo + UFO-specific fields)
+  // form/editing (w/ photo + address + anonymous)
   const [editing, setEditing] = useState<Sighting | null>(null);
   const [form, setForm] = useState<Partial<Sighting>>({
     city: '', state: '', shape: '', duration: '', summary: '',
-    vehicle_make: '', vehicle_model: '', lat: null, lon: null, reported_at: new Date().toISOString(),
-    color: '', altitude: '', speed: '', direction: '', witnesses: null, uap_type: '',
-    photo_url: null,
+    vehicle_make: '', vehicle_model: '', lat: null, lon: null,
+    reported_at: null,                       // set after mount to avoid SSR mismatch
+    photo_url: null, address_text: '',
   });
-  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  // After mount, set a local default timestamp once
+  useEffect(() => {
+    if (hydrated && !form.reported_at) {
+      setForm(f => ({ ...f, reported_at: new Date().toISOString() }));
+    }
+  }, [hydrated, form.reported_at]);
 
-  // support short-code invite links (?roomId= or ?code=)
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [anonymous, setAnonymous] = useState(false);
+
+  // support invite links (?roomId= or ?code=)
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const u = new URL(window.location.href);
-    const rid = u.searchParams.get('roomId'); const code = u.searchParams.get('code');
+    const rid = cleanId(u.searchParams.get('roomId') || '');
+    const code = cleanId(u.searchParams.get('code') || '');
     if (rid && !roomId) { setRoomId(rid); storage.set('ufo:room:id', rid); }
     if (code && !roomId) { void joinRoomByCode(code); }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // load room meta
@@ -144,7 +174,8 @@ export default function ClientPage() {
 
   // loader with filters
   const loadSightings = async (rid: string) => {
-    if (!rid) { setSightings([]); return; } setLoading(true);
+    if (!rid) { setSightings([]); return; } 
+    setLoading(true);
     let qy = supabase.from('sightings').select('*').eq('room_id', rid);
     if (q.trim()) qy = qy.ilike('summary', `%${q}%`);
     if (stateFilter) qy = qy.eq('state', stateFilter);
@@ -157,7 +188,7 @@ export default function ClientPage() {
   };
   useEffect(() => { startTransition(() => { void loadSightings(roomId); }); }, [roomId, q, stateFilter, fromDate, toDate, sort]); // eslint-disable-line
 
-  /* ---------- Broadcast + 8s polling (works without DB replication) ---------- */
+  /* ---------- Broadcast + 8s polling ---------- */
   useEffect(() => {
     if (!roomId) return;
     const ch = supabase.channel(`room-${roomId}`, { config: { broadcast: { self: false } } });
@@ -168,9 +199,11 @@ export default function ClientPage() {
   }, [roomId]); // eslint-disable-line
 
   /* ---------- Auth ---------- */
-  async function sendMagicLink(email: string) { setAuthLoading(true);
+  async function sendMagicLink(email: string) { 
+    setAuthLoading(true);
     const { error } = await supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: true } });
-    setAuthLoading(false); if (error) alert(error.message); else alert('Magic link sent!');
+    setAuthLoading(false); 
+    if (error) alert(error.message); else alert('Magic link sent!');
   }
   async function signOut() { await supabase.auth.signOut(); }
 
@@ -188,12 +221,12 @@ export default function ClientPage() {
     alert(`Room created.\nID: ${r.id}\nCode: ${r.short_code}`);
   }
   async function joinRoomById(idOrCode: string) {
-    // accept UUID or short_code
+    const input = cleanId(idOrCode);
     let r: RoomRow | null = null;
-    const byId = await supabase.from('rooms').select('*').eq('id', idOrCode).maybeSingle();
+    const byId = await supabase.from('rooms').select('*').eq('id', input).maybeSingle();
     if (byId.data) r = byId.data as RoomRow;
     if (!r) {
-      const byCode = await supabase.from('rooms').select('*').eq('short_code', idOrCode).maybeSingle();
+      const byCode = await supabase.from('rooms').select('*').eq('short_code', input).maybeSingle();
       if (byCode.data) r = byCode.data as RoomRow;
     }
     if (!r) return alert('Room ID not found.');
@@ -212,11 +245,24 @@ export default function ClientPage() {
   async function uploadPhotoIfNeeded(): Promise<string | null> {
     if (!photoFile) return form.photo_url ?? null;
     const bucket = 'sighting-photos';
-    const path = `${roomId}/${crypto.randomUUID()}-${photoFile.name.replace(/\s+/g,'_')}`;
-    const { data, error } = await supabase.storage.from(bucket).upload(path, photoFile, { upsert: false });
+    const dir = cleanId(roomId || 'room');
+    const safeName = cleanFileName(photoFile.name);
+    const path = `${dir}/${crypto.randomUUID()}-${safeName}`;
+    const { error } = await supabase.storage.from(bucket).upload(path, photoFile, { upsert: false });
     if (error) { alert(`Upload failed: ${error.message}`); return form.photo_url ?? null; }
     const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
     return pub?.publicUrl ?? null;
+  }
+
+  /* ---------- Geocoding helpers ---------- */
+  async function geocodeAddress(q: string) {
+    const res = await fetch(`/api/geocode?mode=search&q=${encodeURIComponent(q)}`);
+    const arr = await res.json();
+    return Array.isArray(arr) && arr.length ? arr[0] : null;
+  }
+  async function reverseGeocode(lat: number, lon: number) {
+    const res = await fetch(`/api/geocode?mode=reverse&lat=${lat}&lon=${lon}`);
+    return await res.json();
   }
 
   /* ---------- CRUD ---------- */
@@ -232,18 +278,18 @@ export default function ClientPage() {
       shape: (form.shape ?? '').trim() || null,
       duration: (form.duration ?? '').trim() || null,
       summary: (form.summary ?? '').trim(),
+      title:  (form.summary ?? '').trim(),
       vehicle_make: (form.vehicle_make ?? '').trim() || null,
       vehicle_model: (form.vehicle_model ?? '').trim() || null,
       lat: form.lat ?? null, lon: form.lon ?? null,
+      lon: form.lon ?? null,
+      lng: form.lon ?? null,
       reported_at: form.reported_at ?? new Date().toISOString(),
-      created_by: sessionEmail || null,
+      when_iso:    form.reported_at ?? new Date().toISOString(), 
+      created_by: anonymous ? null : (sessionEmail || null),
+      user_name: anonymous ? 'Anonymous' : (sessionEmail || 'Anonymous'), 
       photo_url: photo_url ?? null,
-      color: (form.color ?? '').trim() || null,
-      altitude: (form.altitude ?? '').trim() || null,
-      speed: (form.speed ?? '').trim() || null,
-      direction: (form.direction ?? '').trim() || null,
-      witnesses: form.witnesses ?? null,
-      uap_type: (form.uap_type ?? '').trim() || null,
+      address_text: (form.address_text ?? '').trim() || null,
     };
 
     if (!payload.city || !payload.state || !payload.summary) return alert('City, State, and Summary are required.');
@@ -260,10 +306,11 @@ export default function ClientPage() {
     // broadcast
     try { await supabase.channel(`room-${roomId}`).send({ type:'broadcast', event:'sightings:changed', payload:{ roomId } }); } catch {}
 
-    // reset form
+    // reset form (reported_at left null; will be filled by effect to local now)
     setForm({ city:'', state:'', shape:'', duration:'', summary:'', vehicle_make:'', vehicle_model:'', lat:null, lon:null,
-      reported_at:new Date().toISOString(), color:'', altitude:'', speed:'', direction:'', witnesses:null, uap_type:'', photo_url:null });
+      reported_at:null, photo_url:null, address_text:'' });
     setPhotoFile(null);
+    setAnonymous(false);
     setActiveTab('list');
   }
 
@@ -277,30 +324,127 @@ export default function ClientPage() {
 
   const filtered = useMemo(() => sightings, [sightings]);
 
-  /* ---------- Map component ---------- */
-  function MapPane({ points, selectedId, onSelect }: { points: Sighting[]; selectedId: string | null; onSelect: (id: string) => void; }) {
-    const mapRef = useRef<any>(null); const marks: any[] = useRef([]) as any;
-    useEffect(() => { let mounted = true; (async () => {
-      const L = await loadLeaflet(); if (!mounted) return;
-      if (!mapRef.current) {
-        const node = document.getElementById('ufo-map'); if (!node) return;
-        const m = L.map(node).setView([39.5,-98.35], 4);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'&copy; OpenStreetMap' }).addTo(m);
-        mapRef.current = m;
+  /* ---------- Map component (remember view per room; auto-fit only once) ---------- */
+  function MapPane({ roomId, points, selectedId, onSelect, onMapClick }: {
+    roomId: string; points: Sighting[]; selectedId: string | null; onSelect: (id: string) => void; onMapClick: (lat: number, lon: number) => void;
+  }) {
+    const mapRef = useRef<any>(null);
+    const markersRef = useRef<any[]>([]);
+    const shouldAutofitRef = useRef(true); // may be disabled if we restore a saved view
+
+    // init map
+    useEffect(() => {
+      let mounted = true;
+      (async () => {
+        const L = await loadLeaflet();
+        if (!mounted) return;
+        if (!mapRef.current) {
+          const node = document.getElementById('ufo-map');
+          if (!node) return;
+          const m = L.map(node).setView([39.5, -98.35], 4);
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap contributors' }).addTo(m);
+
+          // Restore saved view for this room, if present
+          const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
+          if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
+            m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
+            // Since we restored a user view, never auto-fit
+            shouldAutofitRef.current = false;
+          }
+
+          // Persist view per room on any move/zoom end
+          m.on('moveend zoomend', () => {
+            const c = m.getCenter(); const z = m.getZoom();
+            storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
+          });
+
+          // stop any future auto-fit once the user interacts
+          const stopAutofit = () => { shouldAutofitRef.current = false; };
+          m.on('zoomstart', stopAutofit);
+          m.on('dragstart', stopAutofit);
+
+          // click to reverse-geocode
+          m.on('click', (ev: any) => {
+            const { lat, lng } = ev.latlng;
+            onMapClick(lat, lng);
+          });
+
+          mapRef.current = m;
+        } else {
+          // Room changed: try applying saved view for new room
+          const m = mapRef.current;
+          const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
+          if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
+            m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
+            shouldAutofitRef.current = false;
+          } else {
+            // Fresh room: allow single auto-fit
+            shouldAutofitRef.current = true;
+            m.setView([39.5, -98.35], 4, { animate: false });
+          }
+        }
+      })();
+      return () => { mounted = false; };
+    }, [roomId, onMapClick]);
+
+    // update markers
+    useEffect(() => {
+      (async () => {
+        const L = await loadLeaflet();
+        const m = mapRef.current; if (!m) return;
+
+        // clear old markers
+        markersRef.current.forEach((mk) => m.removeLayer(mk));
+        markersRef.current = [];
+
+        const bounds = L.latLngBounds([]);
+        points.forEach((p) => {
+          if (p.lat != null && p.lon != null) {
+            const mk = L.marker([p.lat, p.lon]);
+            mk.on('click', () => onSelect(p.id));
+            mk.addTo(m);
+            markersRef.current.push(mk);
+            bounds.extend([p.lat, p.lon]);
+          }
+        });
+
+        // Auto-fit exactly once if allowed and there are points
+        if (markersRef.current.length && shouldAutofitRef.current) {
+          m.fitBounds(bounds.pad(0.2));
+          shouldAutofitRef.current = false; // never auto-fit again for this room session
+        }
+      })();
+    }, [points, onSelect]);
+
+    // pan to selected (no re-enable of autofit)
+    useEffect(() => {
+      const m = mapRef.current;
+      if (!m || !selectedId) return;
+      const s = points.find((x) => x.id === selectedId);
+      if (s && s.lat != null && s.lon != null) {
+        m.setView([s.lat, s.lon], Math.max(m.getZoom(), 7), { animate: true });
       }
-    })(); return () => { mounted = false; }; }, []);
-    useEffect(() => { (async () => {
-      const L = await loadLeaflet(); const m = mapRef.current; if (!m) return;
-      marks.forEach(mk => m.removeLayer(mk)); (marks as any).length = 0;
-      const bounds = L.latLngBounds([]);
-      points.forEach(p => { if (p.lat!=null && p.lon!=null) { const mk = L.marker([p.lat,p.lon]); mk.on('click',()=>onSelect(p.id)); mk.addTo(m); (marks as any).push(mk); bounds.extend([p.lat,p.lon]); }});
-      if ((marks as any).length) m.fitBounds(bounds.pad(0.2));
-    })(); }, [points, onSelect]);
-    useEffect(() => { const m = mapRef.current; if (!m || !selectedId) return;
-      const s = points.find(x => x.id===selectedId); if (s && s.lat!=null && s.lon!=null) m.setView([s.lat,s.lon], Math.max(m.getZoom(),7), { animate:true });
     }, [selectedId, points]);
+
     return <div id="ufo-map" className="h-[520px] md:h-[650px] w-full rounded-xl border" />;
   }
+
+  // reverse geocode + set form
+  const handleMapClick = async (lat: number, lon: number) => {
+    setForm(f => ({ ...f, lat, lon }));
+    try {
+      const data = await reverseGeocode(lat, lon);
+      if (data?.display_name) {
+        setForm(f => ({
+          ...f, lat, lon,
+          address_text: data.display_name,
+          city: f.city || data.address?.city || data.address?.town || data.address?.village || '',
+          state: f.state || data.address?.state_code || data.address?.state || '',
+        }));
+      }
+    } catch {}
+    setActiveTab('compose');
+  };
 
   /* ---------- UI ---------- */
   return (
@@ -310,7 +454,9 @@ export default function ClientPage() {
         <div>
           <h1 className="text-2xl md:text-3xl font-semibold">UFO Sightings Tracker</h1>
           <p className="text-sm text-gray-500 mt-1">
-            {roomId ? <>Room: <span className="font-medium">{roomName || roomId}</span></> : <em>No room selected (open Settings)</em>}
+            {!hydrated ? <span>&nbsp;</span> : (
+              roomId ? <>Room: <span className="font-medium">{roomName || roomId}</span></> : <em>No room selected (open Settings)</em>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -403,15 +549,14 @@ export default function ClientPage() {
                   <div className="flex items-start justify-between gap-4">
                     <div className="min-w-0">
                       <div className="text-sm text-gray-500">{s.city}, {s.state} • {fmtDate(s.reported_at)}</div>
+                      {s.address_text && <div className="text-xs text-gray-500 mt-0.5">{s.address_text}</div>}
                       <p className="mt-1 break-words">{s.summary}</p>
                       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-600">
                         {s.shape && <span>Shape: <b>{s.shape}</b></span>}
                         {s.duration && <span>Duration: <b>{s.duration}</b></span>}
                         {(s.vehicle_make||s.vehicle_model) && <span>Vehicle: <b>{[s.vehicle_make,s.vehicle_model].filter(Boolean).join(' ')}</b></span>}
-                        {s.color && <span>Color: <b>{s.color}</b></span>}
-                        {s.uap_type && <span>Type: <b>{s.uap_type}</b></span>}
                         {(s.lat!=null&&s.lon!=null)&& <span>Coords: {s.lat}, {s.lon}</span>}
-                        {s.created_by && <span>By: {s.created_by}</span>}
+                        {s.created_by ? <span>By: {s.created_by}</span> : <span>By: Anonymous</span>}
                       </div>
                       {s.photo_url && (
                         <div className="mt-3">
@@ -424,9 +569,8 @@ export default function ClientPage() {
                         onClick={(e)=>{ e.stopPropagation(); setEditing(s); setActiveTab('compose');
                           setForm({ city:s.city, state:s.state, shape:s.shape??'', duration:s.duration??'', summary:s.summary,
                             vehicle_make:s.vehicle_make??'', vehicle_model:s.vehicle_model??'', lat:s.lat, lon:s.lon,
-                            reported_at:s.reported_at, photo_url:s.photo_url ?? null, color:s.color??'', altitude:s.altitude??'',
-                            speed:s.speed??'', direction:s.direction??'', witnesses:s.witnesses??null, uap_type:s.uap_type??'' });
-                          setPhotoFile(null);
+                            reported_at:s.reported_at, photo_url:s.photo_url ?? null, address_text: s.address_text ?? '' });
+                          setPhotoFile(null); setAnonymous(!s.created_by);
                         }}>
                         Edit
                       </button>
@@ -445,7 +589,8 @@ export default function ClientPage() {
       {/* Map tab */}
       {activeTab==='map' && (
         <section className="rounded-2xl border p-4">
-          <MapPane points={filtered} selectedId={selectedId} onSelect={(id)=>setSelectedId(id)} />
+          <MapPane roomId={roomId} points={filtered} selectedId={selectedId} onSelect={(id)=>setSelectedId(id)} onMapClick={handleMapClick} />
+          <p className="text-xs text-gray-500 mt-2">Tip: click anywhere on the map to set coordinates and look up the address. Your last zoom is remembered per room.</p>
         </section>
       )}
 
@@ -469,36 +614,127 @@ export default function ClientPage() {
 
             <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Duration (optional)"
               value={form.duration??''} onChange={(e)=>setForm(f=>({...f, duration:e.target.value}))} />
-            <input type="datetime-local" className="md:col-span-3 rounded-md border px-3 py-2"
-              value={form.reported_at ? new Date(form.reported_at).toISOString().slice(0,16) : new Date().toISOString().slice(0,16)}
-              onChange={(e)=>setForm(f=>({...f, reported_at:new Date(e.target.value).toISOString()}))} />
+            <input
+              type="datetime-local"
+              className="md:col-span-3 rounded-md border px-3 py-2"
+              value={toLocalInputValue(form.reported_at)}
+              onChange={(e)=>setForm(f=>({...f, reported_at:new Date(e.target.value).toISOString()}))}
+            />
             <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Latitude (optional)"
               value={form.lat ?? ''} onChange={(e)=>setForm(f=>({...f, lat:e.target.value?Number(e.target.value):null}))} />
             <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Longitude (optional)"
               value={form.lon ?? ''} onChange={(e)=>setForm(f=>({...f, lon:e.target.value?Number(e.target.value):null}))} />
 
-            {/* UFO fields */}
-            <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Color" value={form.color??''}
-              onChange={(e)=>setForm(f=>({...f, color:e.target.value}))}/>
-            <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Altitude" value={form.altitude??''}
-              onChange={(e)=>setForm(f=>({...f, altitude:e.target.value}))}/>
-            <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Speed" value={form.speed??''}
-              onChange={(e)=>setForm(f=>({...f, speed:e.target.value}))}/>
-            <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Direction" value={form.direction??''}
-              onChange={(e)=>setForm(f=>({...f, direction:e.target.value}))}/>
-            <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="Witnesses" type="number" min={0}
-              value={form.witnesses ?? ''} onChange={(e)=>setForm(f=>({...f, witnesses:e.target.value?Number(e.target.value):null}))}/>
-            <input className="md:col-span-2 rounded-md border px-3 py-2" placeholder="UAP Type (e.g., orb, triangle)" value={form.uap_type??''}
-              onChange={(e)=>setForm(f=>({...f, uap_type:e.target.value}))}/>
+            {/* Address search */}
+            <input
+              className="md:col-span-6 rounded-md border px-3 py-2"
+              placeholder="Address or place (e.g., Post Office, Glen Cove, NY)"
+              value={form.address_text ?? ''}
+              onChange={(e) => setForm(f => ({ ...f, address_text: e.target.value }))}
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter' && (form.address_text ?? '').trim()) {
+                  const top = await geocodeAddress((form.address_text ?? '').trim());
+                  if (top) {
+                    setForm(f => ({
+                      ...f,
+                      lat: Number(top.lat),
+                      lon: Number(top.lon),
+                      address_text: top.display_name || f.address_text || '',
+                      city: f.city || top.address?.city || top.address?.town || top.address?.village || '',
+                      state: f.state || top.address?.state_code || top.address?.state || '',
+                    }));
+                    setActiveTab('map');
+                  } else {
+                    alert('Address not found');
+                  }
+                }
+              }}
+            />
+            <button
+              className="md:col-span-2 rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
+              onClick={async () => {
+                const q = (form.address_text ?? '').trim();
+                if (!q) return;
+                const top = await geocodeAddress(q);
+                if (top) {
+                  setForm(f => ({
+                    ...f,
+                    lat: Number(top.lat),
+                    lon: Number(top.lon),
+                    address_text: top.display_name || f.address_text || '',
+                    city: f.city || top.address?.city || top.address?.town || top.address?.village || '',
+                    state: f.state || top.address?.state_code || top.address?.state || '',
+                  }));
+                  setActiveTab('map');
+                } else {
+                  alert('Address not found');
+                }
+              }}
+            >
+              Find Address
+            </button>
 
             <textarea className="md:col-span-12 rounded-md border px-3 py-2" placeholder="Summary (what happened?)"
               value={form.summary??''} onChange={(e)=>setForm(f=>({...f, summary:e.target.value}))} rows={4} />
 
-            {/* Photo upload */}
-            <div className="md:col-span-12 flex items-center gap-3">
-              <input type="file" accept="image/*" onChange={(e)=>setPhotoFile(e.target.files?.[0] ?? null)} />
-              {form.photo_url && <a className="text-sm underline" href={form.photo_url} target="_blank" rel="noreferrer">current photo</a>}
-            </div>
+            {/* Photo upload (styled button + preview + remove) */}
+<div className="md:col-span-12 flex items-center gap-3">
+  <input
+    id="photo-input"
+    type="file"
+    accept="image/*"
+    // For mobile camera you can add: capture="environment"
+    className="hidden"
+    onChange={(e) => {
+      const f = e.target.files?.[0] ?? null;
+      setPhotoFile(f);
+    }}
+  />
+
+  <label
+    htmlFor="photo-input"
+    className="inline-flex items-center rounded-md border px-3 py-2 text-sm hover:bg-gray-50 cursor-pointer"
+  >
+    Choose Photo
+  </label>
+
+  {photoFile ? (
+    <>
+      <span className="text-sm truncate max-w-[50ch]">{photoFile.name}</span>
+      <button
+        type="button"
+        className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50"
+        onClick={() => {
+          setPhotoFile(null);
+          const el = document.getElementById('photo-input') as HTMLInputElement | null;
+          if (el) el.value = '';
+        }}
+      >
+        Remove
+      </button>
+    </>
+  ) : (
+    <span className="text-sm text-gray-500">No file selected</span>
+  )}
+
+  {form.photo_url && (
+    <a
+      className="ml-auto text-sm underline"
+      href={form.photo_url}
+      target="_blank"
+      rel="noreferrer"
+    >
+      current photo
+    </a>
+  )}
+</div>
+
+            {/* Anonymous */}
+            <label className="md:col-span-12 flex items-center gap-2 text-sm">
+              <input type="checkbox" className="h-4 w-4" checked={anonymous}
+                     onChange={(e) => setAnonymous(e.target.checked)} />
+              Report anonymously (don’t include my email)
+            </label>
           </div>
 
           <div className="flex items-center gap-2">
@@ -508,9 +744,9 @@ export default function ClientPage() {
             </button>
             {editing && (
               <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
-                onClick={()=>{ setEditing(null); setPhotoFile(null);
+                onClick={()=>{ setEditing(null); setPhotoFile(null); setAnonymous(false);
                   setForm({ city:'', state:'', shape:'', duration:'', summary:'', vehicle_make:'', vehicle_model:'', lat:null, lon:null,
-                    reported_at:new Date().toISOString(), color:'', altitude:'', speed:'', direction:'', witnesses:null, uap_type:'', photo_url:null });
+                    reported_at:null, photo_url:null, address_text:'' });
                 }}>
                 Cancel
               </button>
@@ -519,11 +755,20 @@ export default function ClientPage() {
         </section>
       )}
 
-      {/* schema notes */}
+      {/* schema note */}
       <details className="rounded-2xl border p-4 text-sm text-gray-600">
         <summary className="cursor-pointer font-medium">Schema & Storage notes</summary>
         <pre className="mt-3 whitespace-pre-wrap">
-{`Make sure you've created bucket "sighting-photos" in Supabase Storage (public ON).`}
+{`Ensure columns exist on public.sightings:
+  alter table public.sightings add column if not exists city text;
+  alter table public.sightings add column if not exists state text;
+  alter table public.sightings add column if not exists reported_at timestamptz;
+  alter table public.sightings add column if not exists address_text text;
+  alter table public.sightings add column if not exists created_by text;
+Then nudge API cache:
+  select pg_notify('pgrst','reload schema');
+
+Ensure Storage bucket 'sighting-photos' exists (public ON).`}
         </pre>
       </details>
     </main>
@@ -575,17 +820,10 @@ function ShareLink({ roomId }: { roomId: string }) {
   if (!roomId) return null;
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
   const linkUuid = `${origin || ''}/?roomId=${roomId}`;
-  const linkCode = `${origin || ''}/?code=${roomId.slice(0,8)}`; // not exact short_code, but quick share; prefer short_code in DB
   return (
-    <div className="flex flex-col gap-2 mt-3">
-      <div className="flex items-center gap-2">
-        <input className="flex-1 rounded-md border px-3 py-2" value={linkUuid} readOnly />
-        <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={()=>navigator.clipboard.writeText(linkUuid)}>Copy UUID Link</button>
-      </div>
-      <div className="flex items-center gap-2">
-        <input className="flex-1 rounded-md border px-3 py-2" value={linkCode} readOnly />
-        <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={()=>navigator.clipboard.writeText(linkCode)}>Copy Short Link</button>
-      </div>
+    <div className="flex items-center gap-2 mt-3">
+      <input className="flex-1 rounded-md border px-3 py-2" value={linkUuid} readOnly />
+      <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={()=>navigator.clipboard.writeText(linkUuid)}>Copy Link</button>
     </div>
   );
 }
