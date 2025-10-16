@@ -103,7 +103,7 @@ export default function ClientPage() {
   const { roomId, setRoomId, roomName, setRoomName, ownerEmail, setOwnerEmail, adminCode, setAdminCode } = useRoom();
   const localStore = useLocalSightings(roomId);
 
-  // Hydration guard to avoid SSR/Client mismatch
+  // Hydration guard
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => { setHydrated(true); }, []);
 
@@ -137,14 +137,13 @@ export default function ClientPage() {
   const [loading, setLoading] = useState(false); 
   const [selectedId, setSelectedId] = useState<string|null>(null);
 
-  // form/editing (with photo + address + anonymous)
+  // form/editing
   const [editing, setEditing] = useState<Sighting | null>(null);
   const [form, setForm] = useState<Partial<Sighting>>({
     city: '', state: '', shape: '', duration: '', summary: '',
     vehicle_make: '', vehicle_model: '', lat: null, lon: null,
     reported_at: null, photo_url: null, address_text: '',
   });
-  // set a default timestamp after mount (avoid SSR mismatch)
   useEffect(() => {
     if (hydrated && !form.reported_at) {
       setForm(f => ({ ...f, reported_at: new Date().toISOString() }));
@@ -174,7 +173,7 @@ export default function ClientPage() {
     }
   })(); }, [roomId, supabase, setRoomName, setOwnerEmail]);
 
-  // ===== Robust loader with request sequencing guard (prevents stale overwrite) =====
+  // ===== Loader with request sequencing guard =====
   const reqSeq = useRef(0);
   const loadSightings = async (rid: string) => {
     if (!rid) { setSightings([]); return; } 
@@ -198,10 +197,8 @@ export default function ClientPage() {
     setLoading(false);
   };
 
-  // initial + whenever filters change
   useEffect(() => { void loadSightings(roomId); }, [roomId, q, stateFilter, fromDate, toDate, sort]); // eslint-disable-line
 
-  // helper to refresh on demand
   const refreshSightings = async () => { if (roomId) await loadSightings(roomId); };
 
   /* ---------- Broadcast + 8s polling ---------- */
@@ -214,7 +211,7 @@ export default function ClientPage() {
     return () => { try { supabase.removeChannel(ch); } catch {} window.clearInterval(int); };
   }, [roomId]); // eslint-disable-line
 
-  // Refresh when the app regains focus / becomes visible (mobile fix)
+  // Refresh on focus/visibility (mobile)
   useEffect(() => {
     const onWake = () => { void refreshSightings(); };
     window.addEventListener('focus', onWake);
@@ -268,7 +265,7 @@ export default function ClientPage() {
     setSightings([]); setSelectedId(null);
   }
 
-  /* ---------- Upload Photo (error-aware) ---------- */
+  /* ---------- Upload Photo ---------- */
   async function uploadPhotoIfNeeded(): Promise<{ url: string | null; error?: string }> {
     if (!photoFile) return { url: form.photo_url ?? null };
     const bucket = 'sighting-photos';
@@ -281,37 +278,31 @@ export default function ClientPage() {
     return { url: pub?.publicUrl ?? null };
   }
 
- /* ---------- Geocoding helpers ---------- */
-async function geocodeAddress(qIn: string) {
-  // If user typed something short/ambiguous (e.g., "Post Office"),
-  // try to bias it with City/State from the form.
-  const trimmed = qIn.trim();
-  let q = trimmed;
-
-  const city = (form.city ?? '').trim();
-  const st = (form.state ?? '').trim();
-  const isVague = trimmed.length < 20 && !/[,]/.test(trimmed); // likely missing locality
-
-  if (isVague && (city || st)) {
-    q = `${trimmed}${city ? `, ${city}` : ''}${st ? `, ${st}` : ''}`;
+  /* ---------- Geocoding helpers ---------- */
+  async function geocodeAddress(qIn: string) {
+    // If the string is short/ambiguous, append City/State from form
+    const trimmed = qIn.trim();
+    let q = trimmed;
+    const city = (form.city ?? '').trim();
+    const st = (form.state ?? '').trim();
+    const isVague = trimmed.length < 20 && !/[,]/.test(trimmed);
+    if (isVague && (city || st)) {
+      q = `${trimmed}${city ? `, ${city}` : ''}${st ? `, ${st}` : ''}`;
+    }
+    const res = await fetch(`/api/geocode?mode=search&q=${encodeURIComponent(q)}`);
+    const arr = await res.json();
+    return Array.isArray(arr) && arr.length ? arr[0] : null;
   }
-
-  const res = await fetch(`/api/geocode?mode=search&q=${encodeURIComponent(q)}`);
-  const arr = await res.json();
-  return Array.isArray(arr) && arr.length ? arr[0] : null;
-}
-
-async function reverseGeocode(lat: number, lon: number) {
-  const res = await fetch(`/api/geocode?mode=reverse&lat=${lat}&lon=${lon}`);
-  return await res.json();
-}
+  async function reverseGeocode(lat: number, lon: number) {
+    const res = await fetch(`/api/geocode?mode=reverse&lat=${lat}&lon=${lon}`);
+    return await res.json();
+  }
 
   /* ---------- CRUD ---------- */
   async function upsertSighting() {
     if (!roomId) return alert('Set a room in Settings.');
     if (!canPost) return alert('Sign in required to post.');
 
-    // Upload (short-circuit on failure)
     const up = await uploadPhotoIfNeeded();
     if (up.error) { alert(`Upload failed: ${up.error}`); return; }
     const photo_url = up.url;
@@ -323,14 +314,14 @@ async function reverseGeocode(lat: number, lon: number) {
       shape: (form.shape ?? '').trim() || null,
       duration: (form.duration ?? '').trim() || null,
       summary: (form.summary ?? '').trim(),
-      title:  (form.summary ?? '').trim(),          // for DBs requiring title
+      title:  (form.summary ?? '').trim(),          // shim for DBs that require title
       vehicle_make: (form.vehicle_make ?? '').trim() || null,
       vehicle_model: (form.vehicle_model ?? '').trim() || null,
       lat: form.lat ?? null,
       lon: form.lon ?? null,
       lng: form.lon ?? null,                        // some DBs use lng
       reported_at: form.reported_at ?? new Date().toISOString(),
-      when_iso:    form.reported_at ?? new Date().toISOString(), // some DBs require this
+      when_iso:    form.reported_at ?? new Date().toISOString(), // shim
       created_by: anonymous ? null : (sessionEmail || null),
       user_name: anonymous ? 'Anonymous' : (sessionEmail || 'Anonymous'),
       photo_url: photo_url ?? null,
@@ -351,10 +342,8 @@ async function reverseGeocode(lat: number, lon: number) {
       if (error) return alert(error.message);
     }
 
-    // Force-refresh so all devices show it immediately
     await refreshSightings();
 
-    // Broadcast so other tabs/devices auto-update too
     try {
       await supabase.channel(`room-${roomId}`).send({
         type: 'broadcast',
@@ -363,7 +352,6 @@ async function reverseGeocode(lat: number, lon: number) {
       });
     } catch {}
 
-    // Reset form
     setForm({
       city:'', state:'', shape:'', duration:'', summary:'',
       vehicle_make:'', vehicle_model:'', lat:null, lon:null,
@@ -385,152 +373,159 @@ async function reverseGeocode(lat: number, lon: number) {
 
   const filtered = useMemo(() => sightings, [sightings]);
 
-  /* ---------- Map component (remember view per room; draft pin support) ---------- */
- /* ---------- Map component (remember view per room; draft pin; stable layers) ---------- */
-function MapPane({
-  roomId,
-  points,
-  selectedId,
-  draft,                       // { lat, lon } from the form
-  onSelect,
-  onMapClick
-}: {
-  roomId: string;
-  points: Sighting[];
-  selectedId: string | null;
-  draft?: { lat: number | null; lon: number | null };
-  onSelect: (id: string) => void;
-  onMapClick: (lat: number, lon: number) => void;
-}) {
-  const mapRef = useRef<any>(null);
+  /* ---------- Map component (stable layers + draft pin) ---------- */
+  function MapPane({
+    roomId,
+    points,
+    selectedId,
+    draft,                       // { lat, lon }
+    onSelect,
+    onMapClick
+  }: {
+    roomId: string;
+    points: Sighting[];
+    selectedId: string | null;
+    draft?: { lat: number | null; lon: number | null };
+    onSelect: (id: string) => void;
+    onMapClick: (lat: number, lon: number) => void;
+  }) {
+    const mapRef = useRef<any>(null);
 
-  // Separate layers so updating the draft marker never wipes sighting markers
-  const sightingsLayerRef = useRef<any | null>(null);
-  const draftLayerRef = useRef<any | null>(null);
+    // Separate layers so draft never clears sightings
+    const sightingsLayerRef = useRef<any | null>(null);
+    const draftLayerRef = useRef<any | null>(null);
 
-  const shouldAutofitRef = useRef(true);
+    const shouldAutofitRef = useRef(true);
 
-  // init map + layers
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      const L = await loadLeaflet();
-      if (!mounted) return;
+    // init map + layers
+    useEffect(() => {
+      let mounted = true;
+      (async () => {
+        const L = await loadLeaflet();
+        if (!mounted) return;
 
-      if (!mapRef.current) {
-        const node = document.getElementById('ufo-map');
-        if (!node) return;
+        if (!mapRef.current) {
+          const node = document.getElementById('ufo-map');
+          if (!node) return;
 
-        const m = L.map(node).setView([39.5, -98.35], 4);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution:'&copy; OpenStreetMap contributors'
-        }).addTo(m);
+          const m = L.map(node).setView([39.5, -98.35], 4);
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution:'&copy; OpenStreetMap contributors'
+          }).addTo(m);
 
-        // Create stable layers and add to map once
-        sightingsLayerRef.current = L.layerGroup().addTo(m);
-        draftLayerRef.current = L.layerGroup().addTo(m);
+          sightingsLayerRef.current = L.layerGroup().addTo(m);
+          draftLayerRef.current = L.layerGroup().addTo(m);
 
-        // Restore saved view for this room
-        const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
-        if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
-          m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
-          shouldAutofitRef.current = false;
-        }
+          const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
+          if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
+            m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
+            shouldAutofitRef.current = false;
+          }
 
-        // Persist view per room
-        m.on('moveend zoomend', () => {
-          const c = m.getCenter(); const z = m.getZoom();
-          storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
-        });
+          m.on('moveend zoomend', () => {
+            const c = m.getCenter(); const z = m.getZoom();
+            storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
+          });
 
-        // Stop future auto-fit once user interacts
-        const stopAutofit = () => { shouldAutofitRef.current = false; };
-        m.on('zoomstart', stopAutofit);
-        m.on('dragstart', stopAutofit);
+          const stopAutofit = () => { shouldAutofitRef.current = false; };
+          m.on('zoomstart', stopAutofit);
+          m.on('dragstart', stopAutofit);
 
-        // Click to reverse-geocode
-        m.on('click', (ev: any) => {
-          const { lat, lng } = ev.latlng;
-          onMapClick(lat, lng);
-        });
+          m.on('click', (ev: any) => {
+            const { lat, lng } = ev.latlng;
+            onMapClick(lat, lng);
+          });
 
-        mapRef.current = m;
-      } else {
-        // Room changed: apply saved view for new room
-        const m = mapRef.current;
-        const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
-        if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
-          m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
-          shouldAutofitRef.current = false;
+          mapRef.current = m;
         } else {
-          shouldAutofitRef.current = true;
-          m.setView([39.5, -98.35], 4, { animate: false });
+          const m = mapRef.current;
+          const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
+          if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
+            m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
+            shouldAutofitRef.current = false;
+          } else {
+            shouldAutofitRef.current = true;
+            m.setView([39.5, -98.35], 4, { animate: false });
+          }
         }
-      }
-    })();
-    return () => { mounted = false; };
-  }, [roomId, onMapClick]);
+      })();
+      return () => { mounted = false; };
+    }, [roomId, onMapClick]);
 
-  // Render/refresh sighting markers (on points change only)
-  useEffect(() => {
-    (async () => {
-      await loadLeaflet(); // ensure L exists
-      const m = mapRef.current; if (!m || !sightingsLayerRef.current) return;
+    // Render/refresh sighting markers (points)
+    useEffect(() => {
+      (async () => {
+        await loadLeaflet();
+        const m = mapRef.current; if (!m || !sightingsLayerRef.current) return;
 
-      const layer = sightingsLayerRef.current;
-      layer.clearLayers();
+        const layer = sightingsLayerRef.current;
+        layer.clearLayers();
 
-      const bounds = (window as any).L.latLngBounds([]);
+        const bounds = (window as any).L.latLngBounds([]);
 
-      points.forEach((p) => {
-        if (p.lat != null && p.lon != null) {
-          const mk = (window as any).L.marker([p.lat, p.lon]);
-          mk.on('click', () => onSelect(p.id));
+        points.forEach((p) => {
+          if (p.lat != null && p.lon != null) {
+            const mk = (window as any).L.marker([p.lat, p.lon]);
+            mk.on('click', () => onSelect(p.id));
+            mk.addTo(layer);
+            bounds.extend([p.lat, p.lon]);
+          }
+        });
+
+        if (points.length && shouldAutofitRef.current) {
+          m.fitBounds(bounds.pad(0.2));
+          shouldAutofitRef.current = false;
+        }
+      })();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [points]);
+
+    // Render/refresh draft marker (separate layer)
+    useEffect(() => {
+      (async () => {
+        await loadLeaflet();
+        const m = mapRef.current; if (!m || !draftLayerRef.current) return;
+        const layer = draftLayerRef.current;
+        layer.clearLayers();
+
+        if (draft && draft.lat != null && draft.lon != null) {
+          const mk = (window as any).L.marker([draft.lat, draft.lon]);
           mk.addTo(layer);
-          bounds.extend([p.lat, p.lon]);
+          m.setView([draft.lat, draft.lon], Math.max(m.getZoom(), 15), { animate: true });
+          shouldAutofitRef.current = false;
         }
-      });
+      })();
+    }, [draft]);
 
-      // Auto-fit to saved points once (unless user already interacted)
-      if (points.length && shouldAutofitRef.current) {
-        m.fitBounds(bounds.pad(0.2));
-        shouldAutofitRef.current = false;
+    // Pan to selected saved sighting
+    useEffect(() => {
+      const m = mapRef.current;
+      if (!m || !selectedId) return;
+      const s = points.find((x) => x.id === selectedId);
+      if (s && s.lat != null && s.lon != null) {
+        m.setView([s.lat, s.lon], Math.max(m.getZoom(), 7), { animate: true });
       }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [points]);
+    }, [selectedId, points]);
 
-  // Render/refresh draft marker (doesn't touch sighting layer)
-  useEffect(() => {
-    (async () => {
-      await loadLeaflet();
-      const m = mapRef.current; if (!m || !draftLayerRef.current) return;
+    return <div id="ufo-map" className="h-[520px] md:h-[650px] w-full rounded-xl border" />;
+  }
 
-      const layer = draftLayerRef.current;
-      layer.clearLayers();
-
-      if (draft && draft.lat != null && draft.lon != null) {
-        const mk = (window as any).L.marker([draft.lat, draft.lon]);
-        mk.addTo(layer);
-        // Center on draft when present
-        m.setView([draft.lat, draft.lon], Math.max(m.getZoom(), 15), { animate: true });
-        shouldAutofitRef.current = false;
+  // reverse geocode + set form from map click
+  const handleMapClick = async (lat: number, lon: number) => {
+    setForm(f => ({ ...f, lat, lon }));
+    try {
+      const data = await reverseGeocode(lat, lon);
+      if (data?.display_name) {
+        setForm(f => ({
+          ...f, lat, lon,
+          address_text: data.display_name,
+          city: f.city || data.address?.city || data.address?.town || data.address?.village || '',
+          state: f.state || data.address?.state_code || data.address?.state || '',
+        }));
       }
-    })();
-  }, [draft]);
-
-  // Pan to selected saved sighting (kept separate from draft)
-  useEffect(() => {
-    const m = mapRef.current;
-    if (!m || !selectedId) return;
-    const s = points.find((x) => x.id === selectedId);
-    if (s && s.lat != null && s.lon != null) {
-      m.setView([s.lat, s.lon], Math.max(m.getZoom(), 7), { animate: true });
-    }
-  }, [selectedId, points]);
-
-  return <div id="ufo-map" className="h-[520px] md:h-[650px] w-full rounded-xl border" />;
-}
+    } catch {}
+    setActiveTab('compose');
+  };
 
   /* ---------- UI ---------- */
   return (
@@ -539,11 +534,6 @@ function MapPane({
       <header className="flex items-start md:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl md:text-3xl font-semibold">UFO Sightings Tracker</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            {!hydrated ? <span>&nbsp;</span> : (
-              roomId ? <>Room: <span className="font-medium">{roomName || roomId}</span></> : <em>No room selected (open Settings)</em>
-            )}
-          </p>
         </div>
         <div className="flex items-center gap-2">
           {isSignedIn ? (
@@ -556,6 +546,10 @@ function MapPane({
           )}
         </div>
       </header>
+
+      <p className="text-sm text-gray-500">
+        {roomId ? <>Room: <span className="font-medium">{roomName || roomId}</span></> : <em>No room selected (open Settings)</em>}
+      </p>
 
       {/* Tabs */}
       <nav className="flex gap-2">
@@ -619,24 +613,19 @@ function MapPane({
               </select>
             </div>
             <div className="flex items-center gap-3">
-              {(loading) && <span className="text-xs text-gray-500">Loading…</span>}
-
-              {/* Clear Filters */}
+              {loading && <span className="text-xs text-gray-500">Loading…</span>}
               <button
                 className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
                 onClick={() => { setQ(''); setStateFilter(''); setFromDate(''); setToDate(''); void refreshSightings(); }}
               >
                 Clear Filters
               </button>
-
-              {/* Manual refresh */}
               <button
                 className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
                 onClick={() => refreshSightings()}
               >
                 Refresh
               </button>
-
               <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
                 onClick={()=>downloadCSV(`sightings-${roomName || roomId || 'room'}.csv`, filtered)} disabled={!filtered.length}>
                 Export CSV
@@ -696,7 +685,7 @@ function MapPane({
             roomId={roomId}
             points={filtered}
             selectedId={selectedId}
-            draft={{ lat: form.lat ?? null, lon: form.lon ?? null }}  // ← pass draft coords
+            draft={{ lat: form.lat ?? null, lon: form.lon ?? null }}
             onSelect={(id)=>setSelectedId(id)}
             onMapClick={handleMapClick}
           />
@@ -787,7 +776,7 @@ function MapPane({
             <textarea className="md:col-span-12 rounded-md border px-3 py-2" placeholder="Summary (what happened?)"
               value={form.summary??''} onChange={(e)=>setForm(f=>({...f, summary:e.target.value}))} rows={4} />
 
-            {/* Photo upload (styled button + preview + remove) */}
+            {/* Photo upload */}
             <div className="md:col-span-12 flex items-center gap-3">
               <input
                 id="photo-input"
@@ -857,35 +846,6 @@ function MapPane({
           </div>
         </section>
       )}
-
-      {/* schema note (for reference) */}
-      <details className="rounded-2xl border p-4 text-sm text-gray-600">
-        <summary className="cursor-pointer font-medium">Schema & Storage notes</summary>
-        <pre className="mt-3 whitespace-pre-wrap">
-{`Ensure columns exist on public.sightings:
-  alter table public.sightings add column if not exists city text;
-  alter table public.sightings add column if not exists state text;
-  alter table public.sightings add column if not exists summary text;
-  alter table public.sightings add column if not exists title text;
-  alter table public.sightings add column if not exists shape text;
-  alter table public.sightings add column if not exists duration text;
-  alter table public.sightings add column if not exists vehicle_make text;
-  alter table public.sightings add column if not exists vehicle_model text;
-  alter table public.sightings add column if not exists lat double precision;
-  alter table public.sightings add column if not exists lon double precision;
-  alter table public.sightings add column if not exists lng double precision;
-  alter table public.sightings add column if not exists reported_at timestamptz;
-  alter table public.sightings add column if not exists when_iso timestamptz;
-  alter table public.sightings add column if not exists address_text text;
-  alter table public.sightings add column if not exists photo_url text;
-  alter table public.sightings add column if not exists created_by text;
-  alter table public.sightings add column if not exists user_name text;
-Then nudge API cache:
-  select pg_notify('pgrst','reload schema');
-
-Ensure Storage bucket 'sighting-photos' exists (public ON) and insert policy allows your use case.`}
-        </pre>
-      </details>
     </main>
   );
 }
