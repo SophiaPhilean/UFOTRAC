@@ -281,16 +281,30 @@ export default function ClientPage() {
     return { url: pub?.publicUrl ?? null };
   }
 
-  /* ---------- Geocoding helpers ---------- */
-  async function geocodeAddress(q: string) {
-    const res = await fetch(`/api/geocode?mode=search&q=${encodeURIComponent(q)}`);
-    const arr = await res.json();
-    return Array.isArray(arr) && arr.length ? arr[0] : null;
+ /* ---------- Geocoding helpers ---------- */
+async function geocodeAddress(qIn: string) {
+  // If user typed something short/ambiguous (e.g., "Post Office"),
+  // try to bias it with City/State from the form.
+  const trimmed = qIn.trim();
+  let q = trimmed;
+
+  const city = (form.city ?? '').trim();
+  const st = (form.state ?? '').trim();
+  const isVague = trimmed.length < 20 && !/[,]/.test(trimmed); // likely missing locality
+
+  if (isVague && (city || st)) {
+    q = `${trimmed}${city ? `, ${city}` : ''}${st ? `, ${st}` : ''}`;
   }
-  async function reverseGeocode(lat: number, lon: number) {
-    const res = await fetch(`/api/geocode?mode=reverse&lat=${lat}&lon=${lon}`);
-    return await res.json();
-  }
+
+  const res = await fetch(`/api/geocode?mode=search&q=${encodeURIComponent(q)}`);
+  const arr = await res.json();
+  return Array.isArray(arr) && arr.length ? arr[0] : null;
+}
+
+async function reverseGeocode(lat: number, lon: number) {
+  const res = await fetch(`/api/geocode?mode=reverse&lat=${lat}&lon=${lon}`);
+  return await res.json();
+}
 
   /* ---------- CRUD ---------- */
   async function upsertSighting() {
@@ -372,148 +386,151 @@ export default function ClientPage() {
   const filtered = useMemo(() => sightings, [sightings]);
 
   /* ---------- Map component (remember view per room; draft pin support) ---------- */
-  function MapPane({
-    roomId,
-    points,
-    selectedId,
-    draft,                       // { lat, lon } from the form
-    onSelect,
-    onMapClick
-  }: {
-    roomId: string;
-    points: Sighting[];
-    selectedId: string | null;
-    draft?: { lat: number | null; lon: number | null };
-    onSelect: (id: string) => void;
-    onMapClick: (lat: number, lon: number) => void;
-  }) {
-    const mapRef = useRef<any>(null);
-    const markersRef = useRef<any[]>([]);
-    const draftRef = useRef<any | null>(null);
-    const shouldAutofitRef = useRef(true);
+ /* ---------- Map component (remember view per room; draft pin; stable layers) ---------- */
+function MapPane({
+  roomId,
+  points,
+  selectedId,
+  draft,                       // { lat, lon } from the form
+  onSelect,
+  onMapClick
+}: {
+  roomId: string;
+  points: Sighting[];
+  selectedId: string | null;
+  draft?: { lat: number | null; lon: number | null };
+  onSelect: (id: string) => void;
+  onMapClick: (lat: number, lon: number) => void;
+}) {
+  const mapRef = useRef<any>(null);
 
-    // init map
-    useEffect(() => {
-      let mounted = true;
-      (async () => {
-        const L = await loadLeaflet();
-        if (!mounted) return;
-        if (!mapRef.current) {
-          const node = document.getElementById('ufo-map');
-          if (!node) return;
-          const m = L.map(node).setView([39.5, -98.35], 4);
-          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap contributors' }).addTo(m);
+  // Separate layers so updating the draft marker never wipes sighting markers
+  const sightingsLayerRef = useRef<any | null>(null);
+  const draftLayerRef = useRef<any | null>(null);
 
-          // Restore saved view for this room
-          const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
-          if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
-            m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
-            shouldAutofitRef.current = false;
-          }
+  const shouldAutofitRef = useRef(true);
 
-          // Persist view per room
-          m.on('moveend zoomend', () => {
-            const c = m.getCenter(); const z = m.getZoom();
-            storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
-          });
+  // init map + layers
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const L = await loadLeaflet();
+      if (!mounted) return;
 
-          // Stop future auto-fit once user interacts
-          const stopAutofit = () => { shouldAutofitRef.current = false; };
-          m.on('zoomstart', stopAutofit);
-          m.on('dragstart', stopAutofit);
+      if (!mapRef.current) {
+        const node = document.getElementById('ufo-map');
+        if (!node) return;
 
-          // Click to reverse-geocode
-          m.on('click', (ev: any) => {
-            const { lat, lng } = ev.latlng;
-            onMapClick(lat, lng);
-          });
+        const m = L.map(node).setView([39.5, -98.35], 4);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution:'&copy; OpenStreetMap contributors'
+        }).addTo(m);
 
-          mapRef.current = m;
-        } else {
-          // Room changed: apply saved view for new room
-          const m = mapRef.current;
-          const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
-          if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
-            m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
-            shouldAutofitRef.current = false;
-          } else {
-            shouldAutofitRef.current = true;
-            m.setView([39.5, -98.35], 4, { animate: false });
-          }
+        // Create stable layers and add to map once
+        sightingsLayerRef.current = L.layerGroup().addTo(m);
+        draftLayerRef.current = L.layerGroup().addTo(m);
+
+        // Restore saved view for this room
+        const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
+        if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
+          m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
+          shouldAutofitRef.current = false;
         }
-      })();
-      return () => { mounted = false; };
-    }, [roomId, onMapClick]);
 
-    // update markers (saved + draft)
-    useEffect(() => {
-      (async () => {
-        const L = await loadLeaflet();
-        const m = mapRef.current; if (!m) return;
-
-        // clear old sighting markers
-        markersRef.current.forEach((mk) => m.removeLayer(mk));
-        markersRef.current = [];
-
-        const bounds = L.latLngBounds([]);
-        points.forEach((p) => {
-          if (p.lat != null && p.lon != null) {
-            const mk = L.marker([p.lat, p.lon]);
-            mk.on('click', () => onSelect(p.id));
-            mk.addTo(m);
-            markersRef.current.push(mk);
-            bounds.extend([p.lat, p.lon]);
-          }
+        // Persist view per room
+        m.on('moveend zoomend', () => {
+          const c = m.getCenter(); const z = m.getZoom();
+          storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
         });
 
-        // draft marker
-        if (draftRef.current) { m.removeLayer(draftRef.current); draftRef.current = null; }
-        if (draft && draft.lat != null && draft.lon != null) {
-          const mk = L.marker([draft.lat, draft.lon]);
-          mk.addTo(m);
-          draftRef.current = mk;
-          // center on draft
-          m.setView([draft.lat, draft.lon], Math.max(m.getZoom(), 15), { animate: true });
+        // Stop future auto-fit once user interacts
+        const stopAutofit = () => { shouldAutofitRef.current = false; };
+        m.on('zoomstart', stopAutofit);
+        m.on('dragstart', stopAutofit);
+
+        // Click to reverse-geocode
+        m.on('click', (ev: any) => {
+          const { lat, lng } = ev.latlng;
+          onMapClick(lat, lng);
+        });
+
+        mapRef.current = m;
+      } else {
+        // Room changed: apply saved view for new room
+        const m = mapRef.current;
+        const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
+        if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
+          m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
           shouldAutofitRef.current = false;
+        } else {
+          shouldAutofitRef.current = true;
+          m.setView([39.5, -98.35], 4, { animate: false });
         }
+      }
+    })();
+    return () => { mounted = false; };
+  }, [roomId, onMapClick]);
 
-        // auto-fit to saved points once if no draft to focus
-        if (!draft && markersRef.current.length && shouldAutofitRef.current) {
-          m.fitBounds(bounds.pad(0.2));
-          shouldAutofitRef.current = false;
+  // Render/refresh sighting markers (on points change only)
+  useEffect(() => {
+    (async () => {
+      await loadLeaflet(); // ensure L exists
+      const m = mapRef.current; if (!m || !sightingsLayerRef.current) return;
+
+      const layer = sightingsLayerRef.current;
+      layer.clearLayers();
+
+      const bounds = (window as any).L.latLngBounds([]);
+
+      points.forEach((p) => {
+        if (p.lat != null && p.lon != null) {
+          const mk = (window as any).L.marker([p.lat, p.lon]);
+          mk.on('click', () => onSelect(p.id));
+          mk.addTo(layer);
+          bounds.extend([p.lat, p.lon]);
         }
-      })();
-    }, [points, onSelect, draft]);
+      });
 
-    // pan to selected saved sighting
-    useEffect(() => {
-      const m = mapRef.current;
-      if (!m || !selectedId) return;
-      const s = points.find((x) => x.id === selectedId);
-      if (s && s.lat != null && s.lon != null) {
-        m.setView([s.lat, s.lon], Math.max(m.getZoom(), 7), { animate: true });
+      // Auto-fit to saved points once (unless user already interacted)
+      if (points.length && shouldAutofitRef.current) {
+        m.fitBounds(bounds.pad(0.2));
+        shouldAutofitRef.current = false;
       }
-    }, [selectedId, points]);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [points]);
 
-    return <div id="ufo-map" className="h-[520px] md:h-[650px] w-full rounded-xl border" />;
-  }
+  // Render/refresh draft marker (doesn't touch sighting layer)
+  useEffect(() => {
+    (async () => {
+      await loadLeaflet();
+      const m = mapRef.current; if (!m || !draftLayerRef.current) return;
 
-  // reverse geocode + set form from map click
-  const handleMapClick = async (lat: number, lon: number) => {
-    setForm(f => ({ ...f, lat, lon }));
-    try {
-      const data = await reverseGeocode(lat, lon);
-      if (data?.display_name) {
-        setForm(f => ({
-          ...f, lat, lon,
-          address_text: data.display_name,
-          city: f.city || data.address?.city || data.address?.town || data.address?.village || '',
-          state: f.state || data.address?.state_code || data.address?.state || '',
-        }));
+      const layer = draftLayerRef.current;
+      layer.clearLayers();
+
+      if (draft && draft.lat != null && draft.lon != null) {
+        const mk = (window as any).L.marker([draft.lat, draft.lon]);
+        mk.addTo(layer);
+        // Center on draft when present
+        m.setView([draft.lat, draft.lon], Math.max(m.getZoom(), 15), { animate: true });
+        shouldAutofitRef.current = false;
       }
-    } catch {}
-    setActiveTab('compose');
-  };
+    })();
+  }, [draft]);
+
+  // Pan to selected saved sighting (kept separate from draft)
+  useEffect(() => {
+    const m = mapRef.current;
+    if (!m || !selectedId) return;
+    const s = points.find((x) => x.id === selectedId);
+    if (s && s.lat != null && s.lon != null) {
+      m.setView([s.lat, s.lon], Math.max(m.getZoom(), 7), { animate: true });
+    }
+  }, [selectedId, points]);
+
+  return <div id="ufo-map" className="h-[520px] md:h-[650px] w-full rounded-xl border" />;
+}
 
   /* ---------- UI ---------- */
   return (
