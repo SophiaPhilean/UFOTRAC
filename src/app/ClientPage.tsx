@@ -1,3 +1,4 @@
+// src/app/ClientPage.tsx
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -36,8 +37,8 @@ type Sighting = {
   user_name?: string | null;
   photo_url: string | null;
   address_text: string | null;
-  created_at: string;
-  updated_at: string | null;
+  created_at?: string;
+  updated_at?: string | null;
 };
 
 type RoomRow = {
@@ -136,14 +137,14 @@ export default function ClientPage() {
   const [loading, setLoading] = useState(false); 
   const [selectedId, setSelectedId] = useState<string|null>(null);
 
-  // form/editing
+  // form/editing (with photo + address + anonymous)
   const [editing, setEditing] = useState<Sighting | null>(null);
   const [form, setForm] = useState<Partial<Sighting>>({
     city: '', state: '', shape: '', duration: '', summary: '',
     vehicle_make: '', vehicle_model: '', lat: null, lon: null,
-    reported_at: null,
-    photo_url: null, address_text: '',
+    reported_at: null, photo_url: null, address_text: '',
   });
+  // set a default timestamp after mount (avoid SSR mismatch)
   useEffect(() => {
     if (hydrated && !form.reported_at) {
       setForm(f => ({ ...f, reported_at: new Date().toISOString() }));
@@ -153,7 +154,7 @@ export default function ClientPage() {
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [anonymous, setAnonymous] = useState(false);
 
-  // support invite links
+  // invite links (?roomId= / ?code=)
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const u = new URL(window.location.href);
@@ -173,7 +174,7 @@ export default function ClientPage() {
     }
   })(); }, [roomId, supabase, setRoomName, setOwnerEmail]);
 
-  // ===== Robust loader with request sequencing (prevents stale overwrite) =====
+  // ===== Robust loader with request sequencing guard (prevents stale overwrite) =====
   const reqSeq = useRef(0);
   const loadSightings = async (rid: string) => {
     if (!rid) { setSightings([]); return; } 
@@ -188,9 +189,7 @@ export default function ClientPage() {
     qy = qy.order('reported_at', { ascending: sort === 'old' });
 
     const { data, error } = await qy;
-    // Ignore this response if a newer request has started
-    if (mySeq !== reqSeq.current) return;
-
+    if (mySeq !== reqSeq.current) return; // ignore stale responses
     if (!error && data) { 
       const rows = data as Sighting[]; 
       setSightings(rows); 
@@ -310,14 +309,14 @@ export default function ClientPage() {
       shape: (form.shape ?? '').trim() || null,
       duration: (form.duration ?? '').trim() || null,
       summary: (form.summary ?? '').trim(),
-      title:  (form.summary ?? '').trim(),
+      title:  (form.summary ?? '').trim(),          // for DBs requiring title
       vehicle_make: (form.vehicle_make ?? '').trim() || null,
       vehicle_model: (form.vehicle_model ?? '').trim() || null,
       lat: form.lat ?? null,
       lon: form.lon ?? null,
-      lng: form.lon ?? null,
+      lng: form.lon ?? null,                        // some DBs use lng
       reported_at: form.reported_at ?? new Date().toISOString(),
-      when_iso:    form.reported_at ?? new Date().toISOString(),
+      when_iso:    form.reported_at ?? new Date().toISOString(), // some DBs require this
       created_by: anonymous ? null : (sessionEmail || null),
       user_name: anonymous ? 'Anonymous' : (sessionEmail || 'Anonymous'),
       photo_url: photo_url ?? null,
@@ -372,14 +371,28 @@ export default function ClientPage() {
 
   const filtered = useMemo(() => sightings, [sightings]);
 
-  /* ---------- Map component (remember view per room; auto-fit only once) ---------- */
-  function MapPane({ roomId, points, selectedId, onSelect, onMapClick }: {
-    roomId: string; points: Sighting[]; selectedId: string | null; onSelect: (id: string) => void; onMapClick: (lat: number, lon: number) => void;
+  /* ---------- Map component (remember view per room; draft pin support) ---------- */
+  function MapPane({
+    roomId,
+    points,
+    selectedId,
+    draft,                       // { lat, lon } from the form
+    onSelect,
+    onMapClick
+  }: {
+    roomId: string;
+    points: Sighting[];
+    selectedId: string | null;
+    draft?: { lat: number | null; lon: number | null };
+    onSelect: (id: string) => void;
+    onMapClick: (lat: number, lon: number) => void;
   }) {
     const mapRef = useRef<any>(null);
     const markersRef = useRef<any[]>([]);
+    const draftRef = useRef<any | null>(null);
     const shouldAutofitRef = useRef(true);
 
+    // init map
     useEffect(() => {
       let mounted = true;
       (async () => {
@@ -391,21 +404,25 @@ export default function ClientPage() {
           const m = L.map(node).setView([39.5, -98.35], 4);
           L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap contributors' }).addTo(m);
 
+          // Restore saved view for this room
           const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
           if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
             m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
             shouldAutofitRef.current = false;
           }
 
+          // Persist view per room
           m.on('moveend zoomend', () => {
             const c = m.getCenter(); const z = m.getZoom();
             storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
           });
 
+          // Stop future auto-fit once user interacts
           const stopAutofit = () => { shouldAutofitRef.current = false; };
           m.on('zoomstart', stopAutofit);
           m.on('dragstart', stopAutofit);
 
+          // Click to reverse-geocode
           m.on('click', (ev: any) => {
             const { lat, lng } = ev.latlng;
             onMapClick(lat, lng);
@@ -413,6 +430,7 @@ export default function ClientPage() {
 
           mapRef.current = m;
         } else {
+          // Room changed: apply saved view for new room
           const m = mapRef.current;
           const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
           if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
@@ -427,11 +445,13 @@ export default function ClientPage() {
       return () => { mounted = false; };
     }, [roomId, onMapClick]);
 
+    // update markers (saved + draft)
     useEffect(() => {
       (async () => {
         const L = await loadLeaflet();
         const m = mapRef.current; if (!m) return;
 
+        // clear old sighting markers
         markersRef.current.forEach((mk) => m.removeLayer(mk));
         markersRef.current = [];
 
@@ -446,13 +466,26 @@ export default function ClientPage() {
           }
         });
 
-        if (markersRef.current.length && shouldAutofitRef.current) {
+        // draft marker
+        if (draftRef.current) { m.removeLayer(draftRef.current); draftRef.current = null; }
+        if (draft && draft.lat != null && draft.lon != null) {
+          const mk = L.marker([draft.lat, draft.lon]);
+          mk.addTo(m);
+          draftRef.current = mk;
+          // center on draft
+          m.setView([draft.lat, draft.lon], Math.max(m.getZoom(), 15), { animate: true });
+          shouldAutofitRef.current = false;
+        }
+
+        // auto-fit to saved points once if no draft to focus
+        if (!draft && markersRef.current.length && shouldAutofitRef.current) {
           m.fitBounds(bounds.pad(0.2));
           shouldAutofitRef.current = false;
         }
       })();
-    }, [points, onSelect]);
+    }, [points, onSelect, draft]);
 
+    // pan to selected saved sighting
     useEffect(() => {
       const m = mapRef.current;
       if (!m || !selectedId) return;
@@ -465,7 +498,7 @@ export default function ClientPage() {
     return <div id="ufo-map" className="h-[520px] md:h-[650px] w-full rounded-xl border" />;
   }
 
-  // reverse geocode + set form
+  // reverse geocode + set form from map click
   const handleMapClick = async (lat: number, lon: number) => {
     setForm(f => ({ ...f, lat, lon }));
     try {
@@ -642,7 +675,14 @@ export default function ClientPage() {
       {/* Map tab */}
       {activeTab==='map' && (
         <section className="rounded-2xl border p-4">
-          <MapPane roomId={roomId} points={filtered} selectedId={selectedId} onSelect={(id)=>setSelectedId(id)} onMapClick={handleMapClick} />
+          <MapPane
+            roomId={roomId}
+            points={filtered}
+            selectedId={selectedId}
+            draft={{ lat: form.lat ?? null, lon: form.lon ?? null }}  // ← pass draft coords
+            onSelect={(id)=>setSelectedId(id)}
+            onMapClick={handleMapClick}
+          />
           <p className="text-xs text-gray-500 mt-2">Tip: click anywhere on the map to set coordinates and look up the address. Your last zoom is remembered per room.</p>
         </section>
       )}
@@ -801,7 +841,7 @@ export default function ClientPage() {
         </section>
       )}
 
-      {/* schema note */}
+      {/* schema note (for reference) */}
       <details className="rounded-2xl border p-4 text-sm text-gray-600">
         <summary className="cursor-pointer font-medium">Schema & Storage notes</summary>
         <pre className="mt-3 whitespace-pre-wrap">
