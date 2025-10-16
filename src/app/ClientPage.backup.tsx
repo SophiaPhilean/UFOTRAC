@@ -21,20 +21,16 @@ type Sighting = {
   id: string;
   room_id: string;
   reported_at: string; // ISO
-  when_iso?: string | null;
   city: string;
   state: string;
   lat: number | null;
   lon: number | null;
-  lng?: number | null;
   shape: string | null;
   duration: string | null;
   summary: string;
-  title?: string | null;
   vehicle_make: string | null;
   vehicle_model: string | null;
   created_by: string | null;
-  user_name?: string | null;
   photo_url: string | null;
   address_text: string | null;
   created_at: string;
@@ -71,7 +67,7 @@ function downloadCSV(filename: string, rows: Record<string, any>[]) {
 /** Remove quotes/odd chars from ids and filenames for storage paths */
 function cleanId(s: string) { return (s || '').trim().replace(/["'`]/g, ''); }
 function cleanFileName(name: string) { return name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, ''); }
-/** ISO → <input type="datetime-local"> (local time) */
+/** Format ISO → value accepted by <input type="datetime-local"> in LOCAL time */
 function toLocalInputValue(iso?: string | null) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -190,10 +186,10 @@ export default function ClientPage() {
     if (!error && data) { const rows = data as Sighting[]; setSightings(rows); try { localStore.set?.(rows); } catch {} }
     setLoading(false);
   };
+  const refreshSightings = async () => { 
+  if (roomId) await loadSightings(roomId); 
+};
   useEffect(() => { startTransition(() => { void loadSightings(roomId); }); }, [roomId, q, stateFilter, fromDate, toDate, sort]); // eslint-disable-line
-
-  // 👇 helper to refresh on demand (used by focus effect + refresh button + after submit)
-  const refreshSightings = async () => { if (roomId) await loadSightings(roomId); };
 
   /* ---------- Broadcast + 8s polling ---------- */
   useEffect(() => {
@@ -204,17 +200,6 @@ export default function ClientPage() {
     const int = window.setInterval(() => { void loadSightings(roomId); }, 8000);
     return () => { try { supabase.removeChannel(ch); } catch {} window.clearInterval(int); };
   }, [roomId]); // eslint-disable-line
-
-  // 👇 Refresh when the app regains focus / becomes visible (mobile fix)
-  useEffect(() => {
-    const onWake = () => { void refreshSightings(); };
-    window.addEventListener('focus', onWake);
-    document.addEventListener('visibilitychange', onWake);
-    return () => {
-      window.removeEventListener('focus', onWake);
-      document.removeEventListener('visibilitychange', onWake);
-    };
-  }, [roomId]);
 
   /* ---------- Auth ---------- */
   async function sendMagicLink(email: string) { 
@@ -259,17 +244,17 @@ export default function ClientPage() {
     setSightings([]); setSelectedId(null);
   }
 
-  /* ---------- Upload Photo (error-aware) ---------- */
-  async function uploadPhotoIfNeeded(): Promise<{ url: string | null; error?: string }> {
-    if (!photoFile) return { url: form.photo_url ?? null };
+  /* ---------- Upload Photo ---------- */
+  async function uploadPhotoIfNeeded(): Promise<string | null> {
+    if (!photoFile) return form.photo_url ?? null;
     const bucket = 'sighting-photos';
     const dir = cleanId(roomId || 'room');
     const safeName = cleanFileName(photoFile.name);
     const path = `${dir}/${crypto.randomUUID()}-${safeName}`;
     const { error } = await supabase.storage.from(bucket).upload(path, photoFile, { upsert: false });
-    if (error) return { url: form.photo_url ?? null, error: error.message };
+    if (error) { alert(`Upload failed: ${error.message}`); return form.photo_url ?? null; }
     const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
-    return { url: pub?.publicUrl ?? null };
+    return pub?.publicUrl ?? null;
   }
 
   /* ---------- Geocoding helpers ---------- */
@@ -284,73 +269,79 @@ export default function ClientPage() {
   }
 
   /* ---------- CRUD ---------- */
-  async function upsertSighting() {
-    if (!roomId) return alert('Set a room in Settings.');
-    if (!canPost) return alert('Sign in required to post.');
+  // ===== replace ONLY this function =====
+async function upsertSighting() {
+  if (!roomId) return alert('Set a room in Settings.');
+  if (!canPost) return alert('Sign in required to post.');
 
-    // Upload (short-circuit on failure)
-    const up = await uploadPhotoIfNeeded();
-    if (up.error) { alert(`Upload failed: ${up.error}`); return; }
-    const photo_url = up.url;
-
-    const payload = {
-      room_id: roomId,
-      city: (form.city ?? '').trim(),
-      state: (form.state ?? '').trim().toUpperCase(),
-      shape: (form.shape ?? '').trim() || null,
-      duration: (form.duration ?? '').trim() || null,
-      summary: (form.summary ?? '').trim(),
-      title:  (form.summary ?? '').trim(),          // for DBs requiring title
-      vehicle_make: (form.vehicle_make ?? '').trim() || null,
-      vehicle_model: (form.vehicle_model ?? '').trim() || null,
-      lat: form.lat ?? null,
-      lon: form.lon ?? null,
-      lng: form.lon ?? null,                        // some DBs use lng
-      reported_at: form.reported_at ?? new Date().toISOString(),
-      when_iso:    form.reported_at ?? new Date().toISOString(), // some DBs require this
-      created_by: anonymous ? null : (sessionEmail || null),
-      user_name: anonymous ? 'Anonymous' : (sessionEmail || 'Anonymous'),
-      photo_url: photo_url ?? null,
-      address_text: (form.address_text ?? '').trim() || null,
-    };
-
-    if (!payload.city || !payload.state || !payload.summary) {
-      alert('City, State, and Summary are required.');
-      return;
-    }
-
-    // insert or update
-    if (editing) {
-      const { error } = await supabase.from('sightings').update(payload).eq('id', editing.id);
-      if (error) return alert(error.message);
-      setEditing(null);
-    } else {
-      const { error } = await supabase.from('sightings').insert(payload);
-      if (error) return alert(error.message);
-    }
-
-    // Force-refresh so all devices show it immediately
-    await refreshSightings();
-
-    // Broadcast so other tabs/devices auto-update too
-    try {
-      await supabase.channel(`room-${roomId}`).send({
-        type: 'broadcast',
-        event: 'sightings:changed',
-        payload: { roomId }
-      });
-    } catch {}
-
-    // Reset form
-    setForm({
-      city:'', state:'', shape:'', duration:'', summary:'',
-      vehicle_make:'', vehicle_model:'', lat:null, lon:null,
-      reported_at:null, photo_url:null, address_text:''
-    });
-    setPhotoFile(null);
-    setAnonymous(false);
-    setActiveTab('list');
+  // Upload (short-circuit on failure if you added the error-aware uploader)
+  const up = await uploadPhotoIfNeeded();
+  if (up.error) {
+    alert(`Upload failed: ${up.error}`);
+    return; // stop here
   }
+  const photo_url = up.url;
+
+  const payload = {
+    room_id: roomId,
+    city: (form.city ?? '').trim(),
+    state: (form.state ?? '').trim().toUpperCase(),
+    shape: (form.shape ?? '').trim() || null,
+    duration: (form.duration ?? '').trim() || null,
+    summary: (form.summary ?? '').trim(),
+    title:  (form.summary ?? '').trim(),          // satisfies DBs with NOT NULL title
+    vehicle_make: (form.vehicle_make ?? '').trim() || null,
+    vehicle_model: (form.vehicle_model ?? '').trim() || null,
+    lat: form.lat ?? null,
+    lon: form.lon ?? null,
+    lng: form.lon ?? null,                        // some DBs use lng
+    reported_at: form.reported_at ?? new Date().toISOString(),
+    when_iso:    form.reported_at ?? new Date().toISOString(), // some DBs require this
+    created_by: anonymous ? null : (sessionEmail || null),
+    user_name: anonymous ? 'Anonymous' : (sessionEmail || 'Anonymous'),
+    photo_url: photo_url ?? null,
+    address_text: (form.address_text ?? '').trim() || null,
+  };
+
+  if (!payload.city || !payload.state || !payload.summary) {
+    alert('City, State, and Summary are required.');
+    return;
+  }
+
+  // Insert or update
+  if (editing) {
+    const { error } = await supabase.from('sightings').update(payload).eq('id', editing.id);
+    if (error) return alert(error.message);
+    setEditing(null);
+  } else {
+    const { error } = await supabase.from('sightings').insert(payload);
+    if (error) return alert(error.message);
+  }
+
+  // Force-refresh the list so mobile shows the new row immediately
+  await refreshSightings();
+
+  // Broadcast so other tabs/devices auto-update too
+  try {
+    await supabase.channel(`room-${roomId}`).send({
+      type: 'broadcast',
+      event: 'sightings:changed',
+      payload: { roomId }
+    });
+  } catch {}
+
+  // Reset form
+  setForm({
+    city:'', state:'', shape:'', duration:'', summary:'',
+    vehicle_make:'', vehicle_model:'', lat:null, lon:null,
+    reported_at:null, photo_url:null, address_text:''
+  });
+  setPhotoFile(null);
+  setAnonymous(false);
+  setActiveTab('list');
+}
+// ===== end of replacement =====
+
 
   async function deleteSighting(id: string) {
     if (!isAdmin) return alert('Admin code required to delete.');
@@ -358,7 +349,6 @@ export default function ClientPage() {
     const { error } = await supabase.from('sightings').delete().eq('id', id);
     if (error) return alert(error.message);
     try { await supabase.channel(`room-${roomId}`).send({ type:'broadcast', event:'sightings:changed', payload:{ roomId } }); } catch {}
-    await refreshSightings();
   }
 
   const filtered = useMemo(() => sightings, [sightings]);
@@ -383,10 +373,11 @@ export default function ClientPage() {
           const m = L.map(node).setView([39.5, -98.35], 4);
           L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap contributors' }).addTo(m);
 
-          // Restore saved view for this room
+          // Restore saved view for this room, if present
           const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
           if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
             m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
+            // Since we restored a user view, never auto-fit
             shouldAutofitRef.current = false;
           }
 
@@ -396,12 +387,12 @@ export default function ClientPage() {
             storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
           });
 
-          // Stop future auto-fit once user interacts
+          // stop any future auto-fit once the user interacts
           const stopAutofit = () => { shouldAutofitRef.current = false; };
           m.on('zoomstart', stopAutofit);
           m.on('dragstart', stopAutofit);
 
-          // Click to reverse-geocode
+          // click to reverse-geocode
           m.on('click', (ev: any) => {
             const { lat, lng } = ev.latlng;
             onMapClick(lat, lng);
@@ -409,13 +400,14 @@ export default function ClientPage() {
 
           mapRef.current = m;
         } else {
-          // Room changed: apply saved view for new room
+          // Room changed: try applying saved view for new room
           const m = mapRef.current;
           const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
           if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
             m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
             shouldAutofitRef.current = false;
           } else {
+            // Fresh room: allow single auto-fit
             shouldAutofitRef.current = true;
             m.setView([39.5, -98.35], 4, { animate: false });
           }
@@ -448,12 +440,12 @@ export default function ClientPage() {
         // Auto-fit exactly once if allowed and there are points
         if (markersRef.current.length && shouldAutofitRef.current) {
           m.fitBounds(bounds.pad(0.2));
-          shouldAutofitRef.current = false;
+          shouldAutofitRef.current = false; // never auto-fit again for this room session
         }
       })();
     }, [points, onSelect]);
 
-    // pan to selected
+    // pan to selected (no re-enable of autofit)
     useEffect(() => {
       const m = mapRef.current;
       if (!m || !selectedId) return;
@@ -571,13 +563,6 @@ export default function ClientPage() {
             </div>
             <div className="flex items-center gap-3">
               {(loading || isPending) && <span className="text-xs text-gray-500">Loading…</span>}
-              {/* Manual refresh */}
-              <button
-                className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
-                onClick={() => refreshSightings()}
-              >
-                Refresh
-              </button>
               <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
                 onClick={()=>downloadCSV(`sightings-${roomName || roomId || 'room'}.csv`, filtered)} disabled={!filtered.length}>
                 Export CSV
@@ -722,50 +707,56 @@ export default function ClientPage() {
               value={form.summary??''} onChange={(e)=>setForm(f=>({...f, summary:e.target.value}))} rows={4} />
 
             {/* Photo upload (styled button + preview + remove) */}
-            <div className="md:col-span-12 flex items-center gap-3">
-              <input
-                id="photo-input"
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0] ?? null;
-                  // optional size gate: if (f && f.size > 5 * 1024 * 1024) { alert('Please choose an image under 5 MB.'); e.currentTarget.value=''; return; }
-                  setPhotoFile(f);
-                }}
-              />
-              <label
-                htmlFor="photo-input"
-                className="inline-flex items-center rounded-md border px-3 py-2 text-sm hover:bg-gray-50 cursor-pointer"
-              >
-                Choose Photo
-              </label>
+<div className="md:col-span-12 flex items-center gap-3">
+  <input
+    id="photo-input"
+    type="file"
+    accept="image/*"
+    // For mobile camera you can add: capture="environment"
+    className="hidden"
+    onChange={(e) => {
+      const f = e.target.files?.[0] ?? null;
+      setPhotoFile(f);
+    }}
+  />
 
-              {photoFile ? (
-                <>
-                  <span className="text-sm truncate max-w-[50ch]">{photoFile.name}</span>
-                  <button
-                    type="button"
-                    className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50"
-                    onClick={() => {
-                      setPhotoFile(null);
-                      const el = document.getElementById('photo-input') as HTMLInputElement | null;
-                      if (el) el.value = '';
-                    }}
-                  >
-                    Remove
-                  </button>
-                </>
-              ) : (
-                <span className="text-sm text-gray-500">No file selected</span>
-              )}
+  <label
+    htmlFor="photo-input"
+    className="inline-flex items-center rounded-md border px-3 py-2 text-sm hover:bg-gray-50 cursor-pointer"
+  >
+    Choose Photo
+  </label>
 
-              {form.photo_url && (
-                <a className="ml-auto text-sm underline" href={form.photo_url} target="_blank" rel="noreferrer">
-                  current photo
-                </a>
-              )}
-            </div>
+  {photoFile ? (
+    <>
+      <span className="text-sm truncate max-w-[50ch]">{photoFile.name}</span>
+      <button
+        type="button"
+        className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50"
+        onClick={() => {
+          setPhotoFile(null);
+          const el = document.getElementById('photo-input') as HTMLInputElement | null;
+          if (el) el.value = '';
+        }}
+      >
+        Remove
+      </button>
+    </>
+  ) : (
+    <span className="text-sm text-gray-500">No file selected</span>
+  )}
+
+  {form.photo_url && (
+    <a
+      className="ml-auto text-sm underline"
+      href={form.photo_url}
+      target="_blank"
+      rel="noreferrer"
+    >
+      current photo
+    </a>
+  )}
+</div>
 
             {/* Anonymous */}
             <label className="md:col-span-12 flex items-center gap-2 text-sm">
@@ -800,25 +791,13 @@ export default function ClientPage() {
 {`Ensure columns exist on public.sightings:
   alter table public.sightings add column if not exists city text;
   alter table public.sightings add column if not exists state text;
-  alter table public.sightings add column if not exists summary text;
-  alter table public.sightings add column if not exists title text;
-  alter table public.sightings add column if not exists shape text;
-  alter table public.sightings add column if not exists duration text;
-  alter table public.sightings add column if not exists vehicle_make text;
-  alter table public.sightings add column if not exists vehicle_model text;
-  alter table public.sightings add column if not exists lat double precision;
-  alter table public.sightings add column if not exists lon double precision;
-  alter table public.sightings add column if not exists lng double precision;
   alter table public.sightings add column if not exists reported_at timestamptz;
-  alter table public.sightings add column if not exists when_iso timestamptz;
   alter table public.sightings add column if not exists address_text text;
-  alter table public.sightings add column if not exists photo_url text;
   alter table public.sightings add column if not exists created_by text;
-  alter table public.sightings add column if not exists user_name text;
 Then nudge API cache:
   select pg_notify('pgrst','reload schema');
 
-Ensure Storage bucket 'sighting-photos' exists (public ON) and insert policy allows your use case.`}
+Ensure Storage bucket 'sighting-photos' exists (public ON).`}
         </pre>
       </details>
     </main>
