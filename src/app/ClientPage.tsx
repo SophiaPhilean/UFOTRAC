@@ -1,7 +1,6 @@
-// src/app/ClientPage.tsx
 'use client';
 
-import React, { useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useSupabase } from '@/lib/useSupabase';
 import { useRoom } from '@/lib/useRoom';
 import { useLocalSightings } from '@/lib/useLocal';
@@ -135,18 +134,16 @@ export default function ClientPage() {
   // data
   const [sightings, setSightings] = useState<Sighting[]>([]); 
   const [loading, setLoading] = useState(false); 
-  const [isPending, startTransition] = useTransition();
   const [selectedId, setSelectedId] = useState<string|null>(null);
 
-  // form/editing (w/ photo + address + anonymous)
+  // form/editing
   const [editing, setEditing] = useState<Sighting | null>(null);
   const [form, setForm] = useState<Partial<Sighting>>({
     city: '', state: '', shape: '', duration: '', summary: '',
     vehicle_make: '', vehicle_model: '', lat: null, lon: null,
-    reported_at: null,                       // set after mount to avoid SSR mismatch
+    reported_at: null,
     photo_url: null, address_text: '',
   });
-  // After mount, set a local default timestamp once
   useEffect(() => {
     if (hydrated && !form.reported_at) {
       setForm(f => ({ ...f, reported_at: new Date().toISOString() }));
@@ -156,7 +153,7 @@ export default function ClientPage() {
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [anonymous, setAnonymous] = useState(false);
 
-  // support invite links (?roomId= or ?code=)
+  // support invite links
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const u = new URL(window.location.href);
@@ -176,23 +173,36 @@ export default function ClientPage() {
     }
   })(); }, [roomId, supabase, setRoomName, setOwnerEmail]);
 
-  // loader with filters
+  // ===== Robust loader with request sequencing (prevents stale overwrite) =====
+  const reqSeq = useRef(0);
   const loadSightings = async (rid: string) => {
     if (!rid) { setSightings([]); return; } 
+    const mySeq = ++reqSeq.current;
     setLoading(true);
+
     let qy = supabase.from('sightings').select('*').eq('room_id', rid);
     if (q.trim()) qy = qy.ilike('summary', `%${q}%`);
     if (stateFilter) qy = qy.eq('state', stateFilter);
     if (fromDate) qy = qy.gte('reported_at', new Date(fromDate).toISOString());
     if (toDate) { const end = new Date(toDate); end.setHours(23,59,59,999); qy = qy.lte('reported_at', end.toISOString()); }
     qy = qy.order('reported_at', { ascending: sort === 'old' });
+
     const { data, error } = await qy;
-    if (!error && data) { const rows = data as Sighting[]; setSightings(rows); try { localStore.set?.(rows); } catch {} }
+    // Ignore this response if a newer request has started
+    if (mySeq !== reqSeq.current) return;
+
+    if (!error && data) { 
+      const rows = data as Sighting[]; 
+      setSightings(rows); 
+      try { localStore.set?.(rows); } catch {} 
+    }
     setLoading(false);
   };
-  useEffect(() => { startTransition(() => { void loadSightings(roomId); }); }, [roomId, q, stateFilter, fromDate, toDate, sort]); // eslint-disable-line
 
-  // 👇 helper to refresh on demand (used by focus effect + refresh button + after submit)
+  // initial + whenever filters change
+  useEffect(() => { void loadSightings(roomId); }, [roomId, q, stateFilter, fromDate, toDate, sort]); // eslint-disable-line
+
+  // helper to refresh on demand
   const refreshSightings = async () => { if (roomId) await loadSightings(roomId); };
 
   /* ---------- Broadcast + 8s polling ---------- */
@@ -205,7 +215,7 @@ export default function ClientPage() {
     return () => { try { supabase.removeChannel(ch); } catch {} window.clearInterval(int); };
   }, [roomId]); // eslint-disable-line
 
-  // 👇 Refresh when the app regains focus / becomes visible (mobile fix)
+  // Refresh when the app regains focus / becomes visible (mobile fix)
   useEffect(() => {
     const onWake = () => { void refreshSightings(); };
     window.addEventListener('focus', onWake);
@@ -300,14 +310,14 @@ export default function ClientPage() {
       shape: (form.shape ?? '').trim() || null,
       duration: (form.duration ?? '').trim() || null,
       summary: (form.summary ?? '').trim(),
-      title:  (form.summary ?? '').trim(),          // for DBs requiring title
+      title:  (form.summary ?? '').trim(),
       vehicle_make: (form.vehicle_make ?? '').trim() || null,
       vehicle_model: (form.vehicle_model ?? '').trim() || null,
       lat: form.lat ?? null,
       lon: form.lon ?? null,
-      lng: form.lon ?? null,                        // some DBs use lng
+      lng: form.lon ?? null,
       reported_at: form.reported_at ?? new Date().toISOString(),
-      when_iso:    form.reported_at ?? new Date().toISOString(), // some DBs require this
+      when_iso:    form.reported_at ?? new Date().toISOString(),
       created_by: anonymous ? null : (sessionEmail || null),
       user_name: anonymous ? 'Anonymous' : (sessionEmail || 'Anonymous'),
       photo_url: photo_url ?? null,
@@ -319,7 +329,6 @@ export default function ClientPage() {
       return;
     }
 
-    // insert or update
     if (editing) {
       const { error } = await supabase.from('sightings').update(payload).eq('id', editing.id);
       if (error) return alert(error.message);
@@ -369,9 +378,8 @@ export default function ClientPage() {
   }) {
     const mapRef = useRef<any>(null);
     const markersRef = useRef<any[]>([]);
-    const shouldAutofitRef = useRef(true); // may be disabled if we restore a saved view
+    const shouldAutofitRef = useRef(true);
 
-    // init map
     useEffect(() => {
       let mounted = true;
       (async () => {
@@ -383,25 +391,21 @@ export default function ClientPage() {
           const m = L.map(node).setView([39.5, -98.35], 4);
           L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap contributors' }).addTo(m);
 
-          // Restore saved view for this room
           const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
           if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
             m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
             shouldAutofitRef.current = false;
           }
 
-          // Persist view per room on any move/zoom end
           m.on('moveend zoomend', () => {
             const c = m.getCenter(); const z = m.getZoom();
             storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
           });
 
-          // Stop future auto-fit once user interacts
           const stopAutofit = () => { shouldAutofitRef.current = false; };
           m.on('zoomstart', stopAutofit);
           m.on('dragstart', stopAutofit);
 
-          // Click to reverse-geocode
           m.on('click', (ev: any) => {
             const { lat, lng } = ev.latlng;
             onMapClick(lat, lng);
@@ -409,7 +413,6 @@ export default function ClientPage() {
 
           mapRef.current = m;
         } else {
-          // Room changed: apply saved view for new room
           const m = mapRef.current;
           const saved = storage.get<{ lat:number; lon:number; zoom:number } | null>(mapStateKey(roomId), null);
           if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
@@ -424,13 +427,11 @@ export default function ClientPage() {
       return () => { mounted = false; };
     }, [roomId, onMapClick]);
 
-    // update markers
     useEffect(() => {
       (async () => {
         const L = await loadLeaflet();
         const m = mapRef.current; if (!m) return;
 
-        // clear old markers
         markersRef.current.forEach((mk) => m.removeLayer(mk));
         markersRef.current = [];
 
@@ -445,7 +446,6 @@ export default function ClientPage() {
           }
         });
 
-        // Auto-fit exactly once if allowed and there are points
         if (markersRef.current.length && shouldAutofitRef.current) {
           m.fitBounds(bounds.pad(0.2));
           shouldAutofitRef.current = false;
@@ -453,7 +453,6 @@ export default function ClientPage() {
       })();
     }, [points, onSelect]);
 
-    // pan to selected
     useEffect(() => {
       const m = mapRef.current;
       if (!m || !selectedId) return;
@@ -570,7 +569,16 @@ export default function ClientPage() {
               </select>
             </div>
             <div className="flex items-center gap-3">
-              {(loading || isPending) && <span className="text-xs text-gray-500">Loading…</span>}
+              {(loading) && <span className="text-xs text-gray-500">Loading…</span>}
+
+              {/* Clear Filters */}
+              <button
+                className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
+                onClick={() => { setQ(''); setStateFilter(''); setFromDate(''); setToDate(''); void refreshSightings(); }}
+              >
+                Clear Filters
+              </button>
+
               {/* Manual refresh */}
               <button
                 className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
@@ -578,6 +586,7 @@ export default function ClientPage() {
               >
                 Refresh
               </button>
+
               <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
                 onClick={()=>downloadCSV(`sightings-${roomName || roomId || 'room'}.csv`, filtered)} disabled={!filtered.length}>
                 Export CSV
@@ -730,7 +739,6 @@ export default function ClientPage() {
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0] ?? null;
-                  // optional size gate: if (f && f.size > 5 * 1024 * 1024) { alert('Please choose an image under 5 MB.'); e.currentTarget.value=''; return; }
                   setPhotoFile(f);
                 }}
               />
