@@ -178,9 +178,10 @@ function MapPane({
   roomId,
   points,
   selectedId,
-  draft, // { lat, lon }
+  draft,                       // { lat, lon }
   onSelect,
   onMapClick,
+  isVisible,                   // <— NEW
 }: {
   roomId: string;
   points: Sighting[];
@@ -188,7 +189,9 @@ function MapPane({
   draft?: { lat: number | null; lon: number | null };
   onSelect: (id: string) => void;
   onMapClick: (lat: number, lon: number) => void;
+  isVisible: boolean;          // <— NEW
 }) {
+
   const mapRef = useRef<any>(null);
   const sightingsLayerRef = useRef<any | null>(null);
   const draftLayerRef = useRef<any | null>(null);
@@ -291,6 +294,55 @@ function MapPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, selectedId]);
 
+  // Keep Leaflet sized correctly whenever the map is shown or the viewport changes
+useEffect(() => {
+  const m = mapRef.current;
+  if (!m) return;
+
+  // When the Map tab becomes visible, invalidate size (some mobiles need 2 passes)
+  if (isVisible) {
+    setTimeout(() => {
+      try { m.invalidateSize(false); } catch {}
+      setTimeout(() => { try { m.invalidateSize(false); } catch {} }, 150);
+    }, 0);
+  }
+
+  const onResize = () => {
+    try { m.invalidateSize(false); } catch {}
+  };
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
+
+  // Also watch the map container’s own size
+  const node = document.getElementById('ufo-map');
+  let ro: ResizeObserver | undefined;
+  if (node && 'ResizeObserver' in window) {
+    ro = new ResizeObserver(() => onResize());
+    ro.observe(node);
+  }
+
+  return () => {
+    window.removeEventListener('resize', onResize);
+    window.removeEventListener('orientationchange', onResize);
+    if (ro) ro.disconnect();
+  };
+}, [isVisible]);
+
+  // Use a stable vh unit on mobile (handles iOS URL bar collapse/expand)
+useEffect(() => {
+  const setVH = () => {
+    const vh = window.innerHeight * 0.01;
+    document.documentElement.style.setProperty('--app-vh', `${vh}px`);
+  };
+  setVH();
+  window.addEventListener('resize', setVH);
+  window.addEventListener('orientationchange', setVH);
+  return () => {
+    window.removeEventListener('resize', setVH);
+    window.removeEventListener('orientationchange', setVH);
+  };
+}, []);
+
   // Render draft pin
   useEffect(() => {
     (async () => {
@@ -313,14 +365,23 @@ function MapPane({
   }, [draft?.lat, draft?.lon]);
 
   return (
-    <div className="rounded-2xl border p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <h3 className="font-semibold">Map</h3>
-        <div className="text-xs text-gray-500">Tap the map to drop a pin into the Report form.</div>
-      </div>
-      <div id="ufo-map" className="w-full h-96 rounded-md overflow-hidden" />
+  <div className="rounded-2xl border overflow-hidden">
+    <div className="mb-3 flex items-center justify-between px-4 pt-4">
+      <h3 className="font-semibold">Map</h3>
+      <div className="text-xs text-gray-500">Tap the map to drop a pin into the Report form.</div>
     </div>
-  );
+
+    {/* Fill most of the mobile viewport; min height for desktop */}
+    <div
+      id="ufo-map"
+      className="w-full"
+      style={{
+        height: 'calc(var(--app-vh, 1vh) * 80)', // 75% of stable viewport height
+        minHeight: 360,
+      }}
+    />
+  </div>
+);
 }
 
 function ListPane({
@@ -1060,6 +1121,7 @@ export default function ClientPage() {
             try { const g = await geocodeAddress(`${clat}, ${clon}`); if (g?.address_text) setAddressText(g.address_text); } catch {}
             setActiveTab('report');
           }}
+          isVisible={activeTab === 'map'}   // <— NEW
         />
       )}
 
