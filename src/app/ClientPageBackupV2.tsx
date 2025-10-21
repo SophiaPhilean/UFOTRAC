@@ -92,7 +92,6 @@ function fmtLocal(dtIso?: string | null) {
   }
 }
 function randomId() {
-  // @ts-ignore
   return crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
 }
 function buildStorageKey(roomId: string, filename: string) {
@@ -189,7 +188,7 @@ function MapPane({
   draft,                       // { lat, lon }
   onSelect,
   onMapClick,
-  isVisible,
+  isVisible,                   // <— NEW
 }: {
   roomId: string;
   points: Sighting[];
@@ -197,15 +196,19 @@ function MapPane({
   draft?: { lat: number | null; lon: number | null };
   onSelect: (id: string) => void;
   onMapClick: (lat: number, lon: number) => void;
-  isVisible: boolean;
+  isVisible: boolean;          // <— NEW
 }) {
-  // ——— Small CSS hint to improve touch panning on mobile
-  useEffect(() => {
+  
+useEffect(() => {
     if (typeof document === 'undefined') return;
     if (document.getElementById('leaflet-touch-style')) return;
     const s = document.createElement('style');
     s.id = 'leaflet-touch-style';
-    s.textContent = `.leaflet-container{touch-action:pan-x pan-y}`;
+    s.textContent = `
+      .leaflet-container {
+        touch-action: pan-x pan-y;
+      }
+    `;
     document.head.appendChild(s);
   }, []);
 
@@ -214,7 +217,6 @@ function MapPane({
   const draftLayerRef = useRef<any | null>(null);
   const shouldAutofitRef = useRef(true);
 
-  // Create/map init + restore last view per room
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -254,7 +256,6 @@ function MapPane({
         });
 
         mapRef.current = m;
-        // First paint may be too early on iOS — nudge it
         setTimeout(() => { try { m.invalidateSize(false); } catch {} }, 0);
       } else {
         const m = mapRef.current;
@@ -271,7 +272,7 @@ function MapPane({
     return () => { mounted = false; };
   }, [roomId, onMapClick]);
 
-  // Draw sightings
+  // Render sightings
   useEffect(() => {
     (async () => {
       const L = await loadLeaflet();
@@ -314,64 +315,83 @@ function MapPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, selectedId]);
 
-  // Keep map sized when visible / resized / rotated
-  useEffect(() => {
-    const m = mapRef.current;
-    if (!m) return;
+  // Keep Leaflet sized correctly whenever the map is shown or the viewport changes
+useEffect(() => {
+  const m = mapRef.current;
+  if (!m) return;
 
-    const run = () => { try { m.invalidateSize(false); } catch {} };
+  // When the Map tab becomes visible, invalidate size (some mobiles need 2 passes)
+  if (isVisible) {
+    setTimeout(() => {
+      try { m.invalidateSize(false); } catch {}
+      setTimeout(() => { try { m.invalidateSize(false); } catch {} }, 150);
+    }, 0);
+  }
 
-    // On tab show, do two passes (helps Safari)
-    if (isVisible) {
-      setTimeout(run, 0);
-      setTimeout(run, 150);
-    }
+  const onResize = () => {
+    try { m.invalidateSize(false); } catch {}
+  };
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
 
-    const onResize = () => run();
-    window.addEventListener('resize', onResize);
-    window.addEventListener('orientationchange', onResize);
+  // Also recover after browser UI scroll/expand/collapse and when tab visibility changes
+useEffect(() => {
+  const m = mapRef.current;
+  if (!m) return;
 
-    // Watch the map container itself
-    const node = document.getElementById('ufo-map');
-    let ro: ResizeObserver | undefined;
-    if (node && 'ResizeObserver' in window) {
-      ro = new ResizeObserver(() => onResize());
-      ro.observe(node);
-    }
+  const run = () => { try { m.invalidateSize(false); } catch {} };
+  const debounced = debounce(run, 160);
 
-    return () => {
-      window.removeEventListener('resize', onResize);
-      window.removeEventListener('orientationchange', onResize);
-      if (ro) ro.disconnect();
-    };
-  }, [isVisible]);
+  const onVisibility = () => { if (document.visibilityState === 'visible') setTimeout(run, 0); };
+  const onFocus = () => setTimeout(run, 0);
+  const onScroll = () => debounced();
 
-  // Recover after browser chrome collapse/expand & tab visibility
-  useEffect(() => {
-    const m = mapRef.current;
-    if (!m) return;
+  document.addEventListener('visibilitychange', onVisibility);
+  window.addEventListener('focus', onFocus);
+  window.addEventListener('scroll', onScroll, { passive: true });
 
-    const run = () => { try { m.invalidateSize(false); } catch {} };
-    const debounced = debounce(run, 160);
+  // one more pass shortly after mount/show to finish tiling on iOS
+  if (isVisible) setTimeout(run, 300);
 
-    const onVisibility = () => { if (document.visibilityState === 'visible') setTimeout(run, 0); };
-    const onFocus = () => setTimeout(run, 0);
-    const onScroll = () => debounced();
+  return () => {
+    document.removeEventListener('visibilitychange', onVisibility);
+    window.removeEventListener('focus', onFocus);
+    window.removeEventListener('scroll', onScroll);
+  };
+}, [isVisible]);
 
-    document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('focus', onFocus);
-    window.addEventListener('scroll', onScroll, { passive: true });
 
-    if (isVisible) setTimeout(run, 300);
+  // Also watch the map container’s own size
+  const node = document.getElementById('ufo-map');
+  let ro: ResizeObserver | undefined;
+  if (node && 'ResizeObserver' in window) {
+    ro = new ResizeObserver(() => onResize());
+    ro.observe(node);
+  }
 
-    return () => {
-      document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('focus', onFocus);
-      window.removeEventListener('scroll', onScroll);
-    };
-  }, [isVisible]);
+  return () => {
+    window.removeEventListener('resize', onResize);
+    window.removeEventListener('orientationchange', onResize);
+    if (ro) ro.disconnect();
+  };
+}, [isVisible]);
 
-  // Draw the draft pin
+  // Use a stable vh unit on mobile (handles iOS URL bar collapse/expand)
+useEffect(() => {
+  const setVH = () => {
+    const vh = window.innerHeight * 0.01;
+    document.documentElement.style.setProperty('--app-vh', `${vh}px`);
+  };
+  setVH();
+  window.addEventListener('resize', setVH);
+  window.addEventListener('orientationchange', setVH);
+  return () => {
+    window.removeEventListener('resize', setVH);
+    window.removeEventListener('orientationchange', setVH);
+  };
+}, []);
+
+  // Render draft pin
   useEffect(() => {
     (async () => {
       const L = await loadLeaflet();
@@ -393,23 +413,26 @@ function MapPane({
   }, [draft?.lat, draft?.lon]);
 
   return (
-    <div className="rounded-2xl border overflow-hidden">
-      <div className="mb-3 flex items-center justify-between px-4 pt-4">
-        <h3 className="font-semibold">Map</h3>
-        <div className="text-xs text-gray-500">Tap the map to drop a pin into the Report form.</div>
-      </div>
-      <div
-        id="ufo-map"
-        className="w-full"
-        style={{
-          height: 'calc(var(--app-vh, 1vh) * 100)', // full safe viewport height on mobile
-          minHeight: 420,
-          willChange: 'transform',
-          transform: 'translateZ(0)',
-        }}
-      />
+  <div className="rounded-2xl border overflow-hidden">
+    <div className="mb-3 flex items-center justify-between px-4 pt-4">
+      <h3 className="font-semibold">Map</h3>
+      <div className="text-xs text-gray-500">Tap the map to drop a pin into the Report form.</div>
     </div>
-  );
+
+    {/* Fill most of the mobile viewport; min height for desktop */}
+    <div
+      id="ufo-map"
+      className="w-full"
+      style={{
+        height: 'calc(var(--app-vh, 1vh) * 100)', // 75% of stable viewport height
+        minHeight: 420,
+         // small GPU nudge helps Safari finish tiles
+    willChange: 'transform',
+    transform: 'translateZ(0)',
+      }}
+    />
+  </div>
+);
 }
 
 function ListPane({
@@ -829,21 +852,6 @@ export default function ClientPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingOriginalMedia, setEditingOriginalMedia] = useState<string[] | null>(null);
 
-  // Use a stable vh unit on mobile (handles iOS URL bar collapse/expand)
-  useEffect(() => {
-    const setVH = () => {
-      const vh = window.innerHeight * 0.01;
-      document.documentElement.style.setProperty('--app-vh', `${vh}px`);
-    };
-    setVH();
-    window.addEventListener('resize', setVH);
-    window.addEventListener('orientationchange', setVH);
-    return () => {
-      window.removeEventListener('resize', setVH);
-      window.removeEventListener('orientationchange', setVH);
-    };
-  }, []);
-
   // Default the report time to "now" (local) on first load
   useEffect(() => {
     if (!whenIso) setWhenIso(new Date().toISOString());
@@ -961,15 +969,6 @@ export default function ClientPage() {
     }
   }
   useEffect(() => { if (roomId) void loadSightings(roomId); /* eslint-disable-next-line */ }, [roomId]);
-
-  // Keep mobile in sync when returning to the tab/app
-  useEffect(() => {
-    const onVis = () => {
-      if (document.visibilityState === 'visible' && roomId) void loadSightings(roomId);
-    };
-    document.addEventListener('visibilitychange', onVis);
-    return () => document.removeEventListener('visibilitychange', onVis);
-  }, [roomId]);
 
   // Media upload
   async function uploadFilesForRoom(room: string, files: File[]): Promise<string[]> {
@@ -1108,6 +1107,7 @@ export default function ClientPage() {
     setLng(s.lng ?? null);
     setWhenIso(s.reported_at || new Date().toISOString());
     setActiveTab('report');
+    // vehicle fields are written by child into global each render; seed via prompt-less approach:
     (globalThis as any).__ufoVehicle = {
       vehicleMake: s.vehicle_make || '',
       vehicleModel: s.vehicle_model || '',
@@ -1172,7 +1172,7 @@ export default function ClientPage() {
             try { const g = await geocodeAddress(`${clat}, ${clon}`); if (g?.address_text) setAddressText(g.address_text); } catch {}
             setActiveTab('report');
           }}
-          isVisible={activeTab === 'map'}
+          isVisible={activeTab === 'map'}   // <— NEW
         />
       )}
 
