@@ -98,6 +98,13 @@ function buildStorageKey(roomId: string, filename: string) {
   const safeName = filename.replace(/\s+/g, '_');
   return `${roomId}/${randomId()}-${safeName}`;
 }
+function debounce<T extends (...args: any[]) => void>(fn: T, ms = 120) {
+  let t: any;
+  return (...args: Parameters<T>) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
 // Convert a Date/ISO to yyyy-MM-ddTHH:mm (LOCAL timezone) for <input type="datetime-local">
 function toLocalInputValue(dOrIso: Date | string) {
   const d = typeof dOrIso === 'string' ? new Date(dOrIso) : dOrIso;
@@ -191,6 +198,19 @@ function MapPane({
   onMapClick: (lat: number, lon: number) => void;
   isVisible: boolean;          // <— NEW
 }) {
+  
+useEffect(() => {
+    if (typeof document === 'undefined') return;
+    if (document.getElementById('leaflet-touch-style')) return;
+    const s = document.createElement('style');
+    s.id = 'leaflet-touch-style';
+    s.textContent = `
+      .leaflet-container {
+        touch-action: pan-x pan-y;
+      }
+    `;
+    document.head.appendChild(s);
+  }, []);
 
   const mapRef = useRef<any>(null);
   const sightingsLayerRef = useRef<any | null>(null);
@@ -236,6 +256,7 @@ function MapPane({
         });
 
         mapRef.current = m;
+        setTimeout(() => { try { m.invalidateSize(false); } catch {} }, 0);
       } else {
         const m = mapRef.current;
         const saved = storage.get<{ lat: number; lon: number; zoom: number } | null>(mapStateKey(roomId));
@@ -313,6 +334,33 @@ useEffect(() => {
   window.addEventListener('resize', onResize);
   window.addEventListener('orientationchange', onResize);
 
+  // Also recover after browser UI scroll/expand/collapse and when tab visibility changes
+useEffect(() => {
+  const m = mapRef.current;
+  if (!m) return;
+
+  const run = () => { try { m.invalidateSize(false); } catch {} };
+  const debounced = debounce(run, 160);
+
+  const onVisibility = () => { if (document.visibilityState === 'visible') setTimeout(run, 0); };
+  const onFocus = () => setTimeout(run, 0);
+  const onScroll = () => debounced();
+
+  document.addEventListener('visibilitychange', onVisibility);
+  window.addEventListener('focus', onFocus);
+  window.addEventListener('scroll', onScroll, { passive: true });
+
+  // one more pass shortly after mount/show to finish tiling on iOS
+  if (isVisible) setTimeout(run, 300);
+
+  return () => {
+    document.removeEventListener('visibilitychange', onVisibility);
+    window.removeEventListener('focus', onFocus);
+    window.removeEventListener('scroll', onScroll);
+  };
+}, [isVisible]);
+
+
   // Also watch the map container’s own size
   const node = document.getElementById('ufo-map');
   let ro: ResizeObserver | undefined;
@@ -376,8 +424,11 @@ useEffect(() => {
       id="ufo-map"
       className="w-full"
       style={{
-        height: 'calc(var(--app-vh, 1vh) * 80)', // 75% of stable viewport height
-        minHeight: 360,
+        height: 'calc(var(--app-vh, 1vh) * 100)', // 75% of stable viewport height
+        minHeight: 420,
+         // small GPU nudge helps Safari finish tiles
+    willChange: 'transform',
+    transform: 'translateZ(0)',
       }}
     />
   </div>
