@@ -79,8 +79,10 @@ const STORAGE_DEFAULT = 'ufo:defaultRoomId';
 // Utilities
 // =========
 function getBaseUrl() {
-  if (typeof window === 'undefined') return '';
-  return window.location.origin;
+  const envUrl = process.env.NEXT_PUBLIC_SITE_URL;
+  if (envUrl) return envUrl.replace(/\/+$/, '');
+  if (typeof window !== 'undefined') return window.location.origin;
+  return '';
 }
 function fmtLocal(dtIso?: string | null) {
   if (!dtIso) return '';
@@ -152,6 +154,23 @@ async function notifyRoom(params: {
     return { status: res.status, json };
   } catch (e) {
     return { status: 0, json: { error: String(e) } };
+  }
+}
+
+// ---- Service worker / cache reset (for stale PWA builds) ----
+async function resetAppCache() {
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+    if ('caches' in window) {
+      const names = await caches.keys();
+      await Promise.all(names.map(n => caches.delete(n)));
+    }
+  } finally {
+    // Hard reload
+    location.replace(location.pathname + location.search + location.hash);
   }
 }
 
@@ -321,7 +340,7 @@ function MapPane({
 
     const run = () => { try { m.invalidateSize(false); } catch {} };
 
-    // On tab show, do two passes (helps Safari)
+    // On tab show, do two passes (helps Safari/Chrome iOS)
     if (isVisible) {
       setTimeout(run, 0);
       setTimeout(run, 150);
@@ -610,6 +629,15 @@ function SettingsPane({
           <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onPreviewRecipients}>
             Preview recipients
           </button>
+          {/* Reset app cache */}
+          <button
+            className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
+            onClick={() => {
+              if (confirm('Reset cached app files and reload?')) resetAppCache();
+            }}
+          >
+            Reset app cache
+          </button>
         </div>
         <p className="text-xs text-gray-500 mt-2">
           Post at least one sighting while signed in so the app can auto-add you to <code>members</code>.
@@ -829,7 +857,7 @@ export default function ClientPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingOriginalMedia, setEditingOriginalMedia] = useState<string[] | null>(null);
 
-  // Use a stable vh unit on mobile (handles iOS URL bar collapse/expand)
+  // Use a stable vh unit on mobile (handles iOS/Chrome URL bar collapse/expand)
   useEffect(() => {
     const setVH = () => {
       const vh = window.innerHeight * 0.01;
@@ -842,6 +870,35 @@ export default function ClientPage() {
       window.removeEventListener('resize', setVH);
       window.removeEventListener('orientationchange', setVH);
     };
+  }, []);
+
+  // Prompt to refresh if a new service worker (new version) is available
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
+
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (reg?.waiting && navigator.serviceWorker.controller) {
+        if (confirm('A new version is available. Refresh now?')) resetAppCache();
+      }
+    });
+
+    let unsub: (() => void) | undefined;
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (!reg) return;
+      const onUpdateFound = () => {
+        const sw = reg.installing;
+        if (!sw) return;
+        sw.addEventListener('statechange', () => {
+          if (sw.state === 'installed' && navigator.serviceWorker.controller) {
+            if (confirm('App updated. Refresh now?')) resetAppCache();
+          }
+        });
+      };
+      reg.addEventListener?.('updatefound', onUpdateFound);
+      unsub = () => reg.removeEventListener?.('updatefound', onUpdateFound);
+    });
+
+    return () => { try { unsub?.(); } catch {} };
   }, []);
 
   // Default the report time to "now" (local) on first load
@@ -871,15 +928,12 @@ export default function ClientPage() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const url = new URL(window.location.href);
-    theRoom(url);
-    function theRoom(u: URL) {
-      const paramRoom = (u.searchParams.get('room') || '').trim();
-      const defaultId = storage.get<string>(STORAGE_DEFAULT);
-      const lastId = storage.get<string>(STORAGE_LAST);
-      const envDefault = process.env.NEXT_PUBLIC_DEFAULT_ROOM_ID || null;
-      const target = paramRoom || defaultId || lastId || envDefault;
-      if (target && !roomId) void joinRoomById(target);
-    }
+    const paramRoom = (url.searchParams.get('room') || '').trim();
+    const defaultId = storage.get<string>(STORAGE_DEFAULT);
+    const lastId = storage.get<string>(STORAGE_LAST);
+    const envDefault = process.env.NEXT_PUBLIC_DEFAULT_ROOM_ID || null;
+    const target = paramRoom || defaultId || lastId || envDefault;
+    if (target && !roomId) void joinRoomById(target);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -906,21 +960,39 @@ export default function ClientPage() {
     }
   }
 
-  // Room helpers
+  // ---- Room helpers (UUID or short_code) ----
   async function joinRoomById(input: string) {
-    const id = (input || '').trim();
-    if (!id) return;
-    const { data, error } = await supabase
-      .from('rooms')
-      .select('id, name')
-      .or(`id.eq.${id},short_code.eq.${id}`)
-      .maybeSingle();
+    const raw = (input || '').trim();
+    if (!raw) return;
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
+    const short = raw.toLowerCase();
+
+    let data: { id: string; name: string | null } | null = null;
+    let error: any = null;
+
+    if (isUuid) {
+      ({ data, error } = await supabase
+        .from('rooms')
+        .select('id, name')
+        .eq('id', raw)
+        .maybeSingle());
+    } else {
+      ({ data, error } = await supabase
+        .from('rooms')
+        .select('id, name')
+        .eq('short_code', short)
+        .maybeSingle());
+    }
+
     if (error) return alert(`Join failed: ${error.message}`);
     if (!data) return alert('Room not found.');
+
     setRoomId(data.id);
     setRoomName(data.name);
     await loadSightings(data.id);
   }
+
   async function createRoom(r: { name?: string | null; owner_email?: string | null }) {
     const payload = {
       name: r.name || null,
@@ -1135,7 +1207,10 @@ export default function ClientPage() {
                 className="rounded-md border px-3 py-1 text-sm"
                 onClick={async () => {
                   const email = prompt('Enter email to magic-link sign in'); if (!email) return;
-                  const { error } = await supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: true } });
+                  const { error } = await supabase.auth.signInWithOtp({
+                    email,
+                    options: { shouldCreateUser: true, emailRedirectTo: `${getBaseUrl()}/` },
+                  });
                   alert(error ? `Sign-in error: ${error.message}` : 'Check your email for the magic link!');
                 }}
               >Sign in</button>
