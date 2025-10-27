@@ -18,25 +18,10 @@ const supabase: SupabaseClient = createClient(supabaseUrl, supabaseKey, {
 const storage = {
   get<T = unknown>(k: string): T | null {
     if (typeof window === 'undefined') return null;
-    try {
-      const raw = window.localStorage.getItem(k);
-      return raw ? (JSON.parse(raw) as T) : null;
-    } catch {
-      return null;
-    }
+    try { const raw = window.localStorage.getItem(k); return raw ? (JSON.parse(raw) as T) : null; } catch { return null; }
   },
-  set(k: string, v: unknown) {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.setItem(k, JSON.stringify(v));
-    } catch {}
-  },
-  remove(k: string) {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.removeItem(k);
-    } catch {}
-  },
+  set(k: string, v: unknown) { if (typeof window !== 'undefined') try { window.localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  remove(k: string) { if (typeof window !== 'undefined') try { window.localStorage.removeItem(k); } catch {} },
 };
 
 // ====================
@@ -70,10 +55,11 @@ export type Member = {
 };
 
 // ======================
-// Deep-link/default room
+// Keys & constants
 // ======================
 const STORAGE_LAST = 'ufo:lastRoomId';
 const STORAGE_DEFAULT = 'ufo:defaultRoomId';
+const STORAGE_TAB = 'ufo:lastTab';
 
 // =========
 // Utilities
@@ -86,27 +72,21 @@ function getBaseUrl() {
 }
 function fmtLocal(dtIso?: string | null) {
   if (!dtIso) return '';
-  try {
-    const d = new Date(dtIso);
-    return d.toLocaleString();
-  } catch {
-    return dtIso!;
-  }
+  try { return new Date(dtIso).toLocaleString(); } catch { return dtIso!; }
 }
 function randomId() {
   // @ts-ignore
   return crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+}
+function randomAdminCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit
 }
 function buildStorageKey(roomId: string, filename: string) {
   const safeName = filename.replace(/\s+/g, '_');
   return `${roomId}/${randomId()}-${safeName}`;
 }
 function debounce<T extends (...args: any[]) => void>(fn: T, ms = 120) {
-  let t: any;
-  return (...args: Parameters<T>) => {
-    clearTimeout(t);
-    t = setTimeout(() => fn(...args), ms);
-  };
+  let t: any; return (...args: Parameters<T>) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 // Convert a Date/ISO to yyyy-MM-ddTHH:mm (LOCAL timezone) for <input type="datetime-local">
 function toLocalInputValue(dOrIso: Date | string) {
@@ -115,46 +95,61 @@ function toLocalInputValue(dOrIso: Date | string) {
   const local = new Date(d.getTime() - off * 60000);
   return local.toISOString().slice(0, 16);
 }
-async function geocodeAddress(q: string) {
+
+// ==========================
+// Leaflet loader (client-only)
+// ==========================
+function injectLeafletCssOnce() {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById('leaflet-css')) return;
+  const link = document.createElement('link');
+  link.id = 'leaflet-css'; link.rel = 'stylesheet';
+  link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+  link.integrity = 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=';
+  link.crossOrigin = ''; document.head.appendChild(link);
+}
+async function loadLeaflet(): Promise<any> { if (typeof window === 'undefined') return null; injectLeafletCssOnce(); return await import('leaflet'); }
+function mapStateKey(roomId: string) { return `ufo:mapstate:${roomId || 'none'}`; }
+
+// NEW: geocodeAddress with map-center bias support
+async function geocodeAddress(q: string, roomIdForBias?: string) {
+  let near: { lat: number; lng: number } | null = null;
+  try {
+    if (roomIdForBias) {
+      const saved = storage.get<{ lat: number; lon: number; zoom: number } | null>(mapStateKey(roomIdForBias));
+      if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon)) {
+        near = { lat: saved.lat, lng: saved.lon };
+      }
+    }
+  } catch {}
+
   const r = await fetch('/api/geocode', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ q }),
+    body: JSON.stringify({ q, near }),
   });
   if (!r.ok) throw new Error(`geocode failed: ${r.status}`);
   return (await r.json()) as { address_text?: string; lat?: number; lng?: number };
 }
+
 async function ensureMember(roomId: string, email?: string, phone_e164?: string) {
   if (!roomId || (!email && !phone_e164)) return;
   try {
     const res = await fetch('/api/members/join', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ room_id: roomId, email, phone_e164 }),
     });
     await res.json().catch(() => ({}));
   } catch {}
 }
 async function notifyRoom(params: {
-  room_id: string;
-  title: string;
-  notes?: string;
-  address_text?: string | null;
-  lat?: number | null;
-  lng?: number | null;
-  when_iso?: string | null;
+  room_id: string; title: string; notes?: string; address_text?: string | null; lat?: number | null; lng?: number | null; when_iso?: string | null;
 }) {
   try {
-    const res = await fetch('/api/notify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(params),
-    });
+    const res = await fetch('/api/notify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(params) });
     const json = await res.json().catch(() => ({}));
     return { status: res.status, json };
-  } catch (e) {
-    return { status: 0, json: { error: String(e) } };
-  }
+  } catch (e) { return { status: 0, json: { error: String(e) } }; }
 }
 
 // ---- Service worker / cache reset (for stale PWA builds) ----
@@ -169,46 +164,15 @@ async function resetAppCache() {
       await Promise.all(names.map(n => caches.delete(n)));
     }
   } finally {
-    // Hard reload
     location.replace(location.pathname + location.search + location.hash);
   }
-}
-
-// ==========================
-// Leaflet loader (client-only)
-// ==========================
-function injectLeafletCssOnce() {
-  if (typeof document === 'undefined') return;
-  if (document.getElementById('leaflet-css')) return;
-  const link = document.createElement('link');
-  link.id = 'leaflet-css';
-  link.rel = 'stylesheet';
-  link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-  link.integrity = 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=';
-  link.crossOrigin = '';
-  document.head.appendChild(link);
-}
-async function loadLeaflet(): Promise<any> {
-  if (typeof window === 'undefined') return null;
-  injectLeafletCssOnce();
-  const L = await import('leaflet');
-  return L;
-}
-function mapStateKey(roomId: string) {
-  return `ufo:mapstate:${roomId || 'none'}`;
 }
 
 // =================================================================
 // ---------- Hoisted child components so they don’t remount ----------
 // =================================================================
 function MapPane({
-  roomId,
-  points,
-  selectedId,
-  draft,                       // { lat, lon }
-  onSelect,
-  onMapClick,
-  isVisible,
+  roomId, points, selectedId, draft, onSelect, onMapClick, isVisible, centerReq,
 }: {
   roomId: string;
   points: Sighting[];
@@ -217,8 +181,9 @@ function MapPane({
   onSelect: (id: string) => void;
   onMapClick: (lat: number, lon: number) => void;
   isVisible: boolean;
+  centerReq: number; // NEW: bump to force a center-to-draft
 }) {
-  // ——— Small CSS hint to improve touch panning on mobile
+  // Touch panning hint for iOS/Chrome
   useEffect(() => {
     if (typeof document === 'undefined') return;
     if (document.getElementById('leaflet-touch-style')) return;
@@ -232,6 +197,7 @@ function MapPane({
   const sightingsLayerRef = useRef<any | null>(null);
   const draftLayerRef = useRef<any | null>(null);
   const shouldAutofitRef = useRef(true);
+  const lastCenterRef = useRef(0); // throttle auto-fit after manual center
 
   // Create/map init + restore last view per room
   useEffect(() => {
@@ -243,10 +209,8 @@ function MapPane({
       if (!mapRef.current) {
         const node = document.getElementById('ufo-map');
         if (!node) return;
-        const m = L.map(node).setView([39.5, -98.35], 4);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '&copy; OpenStreetMap contributors',
-        }).addTo(m);
+        const m = L.map(node, { doubleClickZoom: false }).setView([39.5, -98.35], 4);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(m);
 
         sightingsLayerRef.current = L.layerGroup().addTo(m);
         draftLayerRef.current = L.layerGroup().addTo(m);
@@ -258,32 +222,28 @@ function MapPane({
         }
 
         m.on('moveend zoomend', () => {
-          const c = m.getCenter();
-          const z = m.getZoom();
+          const c = m.getCenter(); const z = m.getZoom();
           storage.set(mapStateKey(roomId), { lat: c.lat, lon: c.lng, zoom: z });
         });
 
         const stopAutofit = () => { shouldAutofitRef.current = false; };
-        m.on('zoomstart', stopAutofit);
-        m.on('dragstart', stopAutofit);
+        m.on('zoomstart', stopAutofit); m.on('dragstart', stopAutofit);
 
-        m.on('click', (ev: any) => {
+        // Double click/tap to create a pin (no double-click zoom)
+        m.on('dblclick', (ev: any) => {
           const { lat, lng } = ev.latlng;
           onMapClick(lat, lng);
         });
 
         mapRef.current = m;
-        // First paint may be too early on iOS — nudge it
         setTimeout(() => { try { m.invalidateSize(false); } catch {} }, 0);
       } else {
         const m = mapRef.current;
         const saved = storage.get<{ lat: number; lon: number; zoom: number } | null>(mapStateKey(roomId));
         if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lon) && Number.isFinite(saved.zoom)) {
-          m.setView([saved.lat, saved.lon], saved.zoom, { animate: false });
-          shouldAutofitRef.current = false;
+          m.setView([saved.lat, saved.lon], saved.zoom, { animate: false }); shouldAutofitRef.current = false;
         } else {
-          shouldAutofitRef.current = true;
-          m.setView([39.5, -98.35], 4, { animate: false });
+          shouldAutofitRef.current = true; m.setView([39.5, -98.35], 4, { animate: false });
         }
       }
     })();
@@ -293,10 +253,8 @@ function MapPane({
   // Draw sightings
   useEffect(() => {
     (async () => {
-      const L = await loadLeaflet();
-      if (!L) return;
-      const m = mapRef.current;
-      const layer = sightingsLayerRef.current;
+      const L = await loadLeaflet(); if (!L) return;
+      const m = mapRef.current; const layer = sightingsLayerRef.current;
       if (!m || !layer) return;
 
       layer.clearLayers();
@@ -305,6 +263,10 @@ function MapPane({
       points.forEach((p) => {
         if (p.lat == null || p.lng == null) return;
         const isSel = selectedId === p.id;
+        const qEnc = encodeURIComponent(p.address_text || `${p.city}, ${p.state}` || 'Sighting');
+        const apple = `https://maps.apple.com/?ll=${p.lat},${p.lng}&q=${qEnc}`;
+        const gmaps = `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lng}`;
+
         const marker = L.circleMarker([p.lat, p.lng], {
           radius: isSel ? 8 : 6,
           weight: isSel ? 2 : 1,
@@ -319,6 +281,10 @@ function MapPane({
                ${p.city || ''}, ${p.state || ''}<br/>
                ${p.address_text ? (p.address_text as string).replace(/</g, '&lt;') + '<br/>' : ''}
                <span style="color:#6b7280">${fmtLocal(p.reported_at)}</span>
+               <div style="margin-top:6px">
+                 <a href="${apple}" target="_blank" rel="noreferrer">Apple Maps</a> •
+                 <a href="${gmaps}" target="_blank" rel="noreferrer">Google Maps</a>
+               </div>
              </div>`
           );
 
@@ -326,37 +292,40 @@ function MapPane({
         bounds.extend([p.lat, p.lng]);
       });
 
-      if (shouldAutofitRef.current && bounds.isValid()) {
+      // Skip auto-fit briefly after a manual center (prevents jump back)
+      const lastCenterRefAny = lastCenterRef.current || 0;
+      const justCentered = Date.now() - lastCenterRefAny < 1000;
+      if (shouldAutofitRef.current && bounds.isValid() && !justCentered) {
         m.fitBounds(bounds.pad(0.15), { animate: false });
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, selectedId]);
 
+  // Center on selectedId when it changes
+  useEffect(() => {
+    const m = mapRef.current; if (!m || !selectedId) return;
+    const p = points.find(x => x.id === selectedId && x.lat != null && x.lng != null);
+    if (!p) return;
+    try {
+      m.setView([p.lat!, p.lng!], Math.max(10, m.getZoom() || 10), { animate: true });
+    } catch {}
+  }, [selectedId, points]);
+
   // Keep map sized when visible / resized / rotated
   useEffect(() => {
-    const m = mapRef.current;
-    if (!m) return;
-
+    const m = mapRef.current; if (!m) return;
     const run = () => { try { m.invalidateSize(false); } catch {} };
 
-    // On tab show, do two passes (helps Safari/Chrome iOS)
-    if (isVisible) {
-      setTimeout(run, 0);
-      setTimeout(run, 150);
-    }
+    if (isVisible) { setTimeout(run, 0); setTimeout(run, 150); }
 
     const onResize = () => run();
     window.addEventListener('resize', onResize);
     window.addEventListener('orientationchange', onResize);
 
-    // Watch the map container itself
     const node = document.getElementById('ufo-map');
     let ro: ResizeObserver | undefined;
-    if (node && 'ResizeObserver' in window) {
-      ro = new ResizeObserver(() => onResize());
-      ro.observe(node);
-    }
+    if (node && 'ResizeObserver' in window) { ro = new ResizeObserver(() => onResize()); ro.observe(node); }
 
     return () => {
       window.removeEventListener('resize', onResize);
@@ -367,9 +336,7 @@ function MapPane({
 
   // Recover after browser chrome collapse/expand & tab visibility
   useEffect(() => {
-    const m = mapRef.current;
-    if (!m) return;
-
+    const m = mapRef.current; if (!m) return;
     const run = () => { try { m.invalidateSize(false); } catch {} };
     const debounced = debounce(run, 160);
 
@@ -393,35 +360,79 @@ function MapPane({
   // Draw the draft pin
   useEffect(() => {
     (async () => {
-      const L = await loadLeaflet();
-      if (!L) return;
-      const layer = draftLayerRef.current;
-      if (!layer) return;
+      const L = await loadLeaflet(); if (!L) return;
+      const layer = draftLayerRef.current; if (!layer) return;
       layer.clearLayers();
       if (draft?.lat != null && draft?.lon != null) {
         const marker = L.circleMarker([draft.lat, draft.lon], {
-          radius: 7,
-          weight: 2,
-          color: '#16a34a',
-          fillColor: '#bbf7d0',
-          fillOpacity: 0.9,
+          radius: 7, weight: 2, color: '#16a34a', fillColor: '#bbf7d0', fillOpacity: 0.9,
         }).bindTooltip('New pin', { permanent: false });
         marker.addTo(layer);
       }
     })();
   }, [draft?.lat, draft?.lon]);
 
+ // Center on the draft pin whenever it changes (with extra safety on mobile)
+useEffect(() => {
+  const m = mapRef.current;
+  if (!m) return;
+
+  const dlat = draft?.lat != null ? Number(draft.lat) : null;
+  const dlon = draft?.lon != null ? Number(draft.lon) : null;
+  if (dlat == null || !Number.isFinite(dlat) || dlon == null || !Number.isFinite(dlon)) return;
+
+  try {
+    shouldAutofitRef.current = false;
+    const nextZoom = Math.max(14, m.getZoom?.() || 14);
+
+    // pass 1: immediate
+    m.setView([dlat, dlon], nextZoom, { animate: true });
+    lastCenterRef.current = Date.now();
+
+    // pass 2: after paint
+    setTimeout(() => {
+      try {
+        m.setView([dlat, dlon], nextZoom, { animate: false });
+        m.invalidateSize(false);
+      } catch {}
+    }, 120);
+
+    // pass 3: belt-and-suspenders on slow mobile
+    setTimeout(() => {
+      try {
+        m.invalidateSize(false);
+      } catch {}
+    }, 360);
+  } catch {}
+}, [draft?.lat, draft?.lon]);
+
+  // NEW: also center whenever centerReq bumps (explicit command from parent)
+  useEffect(() => {
+    const m = mapRef.current;
+    if (!m) return;
+    if (draft?.lat != null && draft?.lon != null) {
+      try {
+        shouldAutofitRef.current = false;
+        const nextZoom = Math.max(14, m.getZoom?.() || 14);
+        m.setView([draft.lat, draft.lon], nextZoom, { animate: true });
+        lastCenterRef.current = Date.now();
+        setTimeout(() => { try { m.invalidateSize(false); } catch {} }, 150);
+      } catch {}
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [centerReq]);
+
   return (
     <div className="rounded-2xl border overflow-hidden">
       <div className="mb-3 flex items-center justify-between px-4 pt-4">
         <h3 className="font-semibold">Map</h3>
-        <div className="text-xs text-gray-500">Tap the map to drop a pin into the Report form.</div>
+        <div className="text-xs text-gray-500">Double-tap/click to drop a pin into the Report form.</div>
       </div>
       <div
         id="ufo-map"
         className="w-full"
         style={{
-          height: 'calc(var(--app-vh, 1vh) * 100)', // full safe viewport height on mobile
+          height: 'calc(var(--app-vh, 1vh) * 100)',
           minHeight: 420,
           willChange: 'transform',
           transform: 'translateZ(0)',
@@ -432,10 +443,11 @@ function MapPane({
 }
 
 function ListPane({
-  sightings, loading, errorMsg, onRefresh, onEdit, onDelete,
+  sightings, loading, errorMsg, onRefresh, onEdit, onDelete, onViewOnMap,
 }: {
   sightings: Sighting[]; loading: boolean; errorMsg: string | null; onRefresh: () => void;
   onEdit: (s: Sighting) => void; onDelete: (s: Sighting) => Promise<void>;
+  onViewOnMap: (s: Sighting) => void;
 }) {
   return (
     <div className="rounded-2xl border p-4">
@@ -480,14 +492,10 @@ function ListPane({
 
             <div className="mt-2 flex items-center gap-2">
               <button className="rounded-md border px-2 py-1 text-xs" onClick={() => onEdit(s)}>Edit</button>
-              <button
-                className="rounded-md border px-2 py-1 text-xs text-red-700"
-                onClick={() => onDelete(s)}
-              >Delete</button>
+              <button className="rounded-md border px-2 py-1 text-xs text-red-700" onClick={() => onDelete(s)}>Delete</button>
+              <button className="rounded-md border px-2 py-1 text-xs" onClick={() => onViewOnMap(s)}>View on map</button>
               {s.lat != null && s.lng != null && (
-                <div className="ml-auto text-xs text-gray-500">
-                  {s.lat.toFixed(5)}, {s.lng.toFixed(5)}
-                </div>
+                <div className="ml-auto text-xs text-gray-500">{s.lat.toFixed(5)}, {s.lng.toFixed(5)}</div>
               )}
             </div>
           </li>
@@ -503,21 +511,14 @@ function ShareLink({ roomId }: { roomId: string }) {
     <div className="mt-3 rounded-md border p-3">
       <h3 className="font-medium mb-2">Share this room</h3>
       <div className="flex gap-2 items-center">
-        <input
-          readOnly
-          value={link}
-          className="flex-1 rounded-md border px-3 py-2 text-sm"
-          onFocus={(e) => e.currentTarget.select()}
-        />
+        <input readOnly value={link} className="flex-1 rounded-md border px-3 py-2 text-sm" onFocus={(e) => e.currentTarget.select()} />
         <button
           className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
           onClick={async () => {
             try { await navigator.clipboard.writeText(link); alert('Link copied'); }
             catch { window.prompt('Copy this link:', link); }
           }}
-        >
-          Copy
-        </button>
+        >Copy</button>
       </div>
       <p className="text-xs text-gray-500 mt-2">Anyone who opens this link will auto-join this room.</p>
     </div>
@@ -551,7 +552,7 @@ function SettingsPane({
       <div className="grid grid-cols-1 md:grid-cols-12 gap-2">
         <input
           className="md:col-span-6 rounded-md border px-3 py-2"
-          placeholder="Join by Room ID (UUID) or Short Code"
+          placeholder="Join by Room ID, Short Code, or Name"
           onKeyDown={async (e: any) => {
             if (e.key === 'Enter') {
               const id = (e.target as HTMLInputElement).value.trim();
@@ -563,7 +564,7 @@ function SettingsPane({
         <button
           className="md:col-span-2 rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
           onClick={() => {
-            const v = prompt('Enter Room ID or Short Code');
+            const v = prompt('Enter Room ID, Short Code, or Name');
             if (v) void joinRoomById(v.trim());
           }}
         >
@@ -571,12 +572,7 @@ function SettingsPane({
         </button>
         <div className="md:col-span-4 flex items-center justify-end">
           <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              className="h-4 w-4"
-              checked={requireAuth}
-              onChange={(e) => setRequireAuth(e.target.checked)}
-            />
+            <input type="checkbox" className="h-4 w-4" checked={requireAuth} onChange={(e) => setRequireAuth(e.target.checked)} />
             Require sign-in to post
           </label>
         </div>
@@ -593,12 +589,8 @@ function SettingsPane({
               const name = (document.getElementById('new-room-name') as HTMLInputElement | null)?.value || '';
               void createRoom({ name, owner_email: sessionEmail || undefined });
             }}
-          >
-            Create
-          </button>
-          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={leaveRoom}>
-            Leave room
-          </button>
+          >Create</button>
+          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={leaveRoom}>Leave room</button>
         </div>
         {roomId && <ShareLink roomId={roomId} />}
 
@@ -609,9 +601,7 @@ function SettingsPane({
               <input type="checkbox" className="h-4 w-4" checked={isDefaultRoom} onChange={toggleDefaultRoom} />
               Make this my default room on this device
             </label>
-            <p className="text-xs text-gray-500 mt-1">
-              You’ll auto-join this room when you open the app. You can change this anytime.
-            </p>
+            <p className="text-xs text-gray-500 mt-1">You’ll auto-join this room when you open the app. You can change this anytime.</p>
           </div>
         )}
       </div>
@@ -620,28 +610,12 @@ function SettingsPane({
       <div className="mt-4 rounded-md border p-3">
         <h3 className="font-medium mb-2">Notifications</h3>
         <div className="flex flex-wrap gap-2">
-          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onTestNotify}>
-            Send Test Email/SMS
-          </button>
-          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onEnsureMeThenTest}>
-            Ensure I’m a member, then Test
-          </button>
-          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onPreviewRecipients}>
-            Preview recipients
-          </button>
-          {/* Reset app cache */}
-          <button
-            className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50"
-            onClick={() => {
-              if (confirm('Reset cached app files and reload?')) resetAppCache();
-            }}
-          >
-            Reset app cache
-          </button>
+          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onTestNotify}>Send Test Email/SMS</button>
+          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onEnsureMeThenTest}>Ensure I’m a member, then Test</button>
+          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onPreviewRecipients}>Preview recipients</button>
+          <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={() => { if (confirm('Reset cached app files and reload?')) resetAppCache(); }}>Reset app cache</button>
         </div>
-        <p className="text-xs text-gray-500 mt-2">
-          Post at least one sighting while signed in so the app can auto-add you to <code>members</code>.
-        </p>
+        <p className="text-xs text-gray-500 mt-2">Post at least one sighting while signed in so the app can auto-add you to <code>members</code>.</p>
       </div>
 
       {/* Save phone for SMS */}
@@ -657,16 +631,13 @@ function SettingsPane({
               const phone = el?.value.trim() || '';
               if (!/^\+[1-9]\d{6,14}$/.test(phone)) return alert('Enter phone in E.164 format, e.g. +15551234567');
               const r = await fetch('/api/members/join', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
+                method: 'POST', headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ room_id: roomId, phone_e164: phone }),
               });
               const json = await r.json().catch(() => ({}));
               alert(`Saved: ${r.status}\n${JSON.stringify(json, null, 2)}`);
             }}
-          >
-            Save my number for SMS
-          </button>
+          >Save my number for SMS</button>
         </div>
         <p className="text-xs text-gray-500 mt-2">We’ll only text for sightings in this room.</p>
       </div>
@@ -688,6 +659,11 @@ function ReportPane({
   onFindAddress,
   onSave,
   onClear,
+  reportAnon, setReportAnon,
+  isGeocoding, isSaving,
+  // NEW:
+  altChoices, setAltChoices,
+  setActiveTab, setCenterReq,
 }: {
   isEditing: boolean; onCancelEdit: () => void;
   summary: string; setSummary: (v: string) => void;
@@ -702,6 +678,13 @@ function ReportPane({
   onFindAddress: () => Promise<void>;
   onSave: () => Promise<void>;
   onClear: () => void;
+  reportAnon: boolean; setReportAnon: (v: boolean) => void;
+  isGeocoding: boolean; isSaving: boolean;
+  // NEW:
+  altChoices: Array<{ label: string; lat: number; lng: number; provider: string }>;
+  setAltChoices: (v: Array<{ label: string; lat: number; lng: number; provider: string }> | ((prev: any) => any)) => void;
+  setActiveTab: (t: 'map' | 'list' | 'report' | 'settings') => void;
+  setCenterReq: React.Dispatch<React.SetStateAction<number>>;
 }) {
   const [vehicleMake, setVehicleMake] = useState('');
   const [vehicleModel, setVehicleModel] = useState('');
@@ -712,19 +695,13 @@ function ReportPane({
     <div className="rounded-2xl border p-4 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="font-semibold">{isEditing ? 'Edit sighting' : 'Report a sighting'}</h3>
-        {isEditing && (
-          <button className="rounded-md border px-3 py-1 text-sm" onClick={onCancelEdit}>Cancel edit</button>
-        )}
+        {isEditing && <button className="rounded-md border px-3 py-1 text-sm" onClick={onCancelEdit}>Cancel edit</button>}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         <label className="flex flex-col gap-1">
           <span className="text-sm">Summary *</span>
-          <input
-            className="rounded-md border px-3 py-2"
-            value={summary}
-            onChange={(e) => setSummary(e.target.value)}
-          />
+          <input className="rounded-md border px-3 py-2" value={summary} onChange={(e) => setSummary(e.target.value)} />
         </label>
 
         <label className="flex flex-col gap-1">
@@ -732,13 +709,8 @@ function ReportPane({
           <input
             className="rounded-md border px-3 py-2"
             type="datetime-local"
-            value={whenIso ? toLocalInputValue(whenIso) : toLocalInputValue(new Date())}
-            onChange={(e) => {
-              const v = e.target.value;
-              if (!v) { setWhenIso(''); return; }
-              const local = new Date(v);
-              setWhenIso(local.toISOString());
-            }}
+              value={whenIso ? toLocalInputValue(whenIso) : ''}
+            onChange={(e) => { const v = e.target.value; if (!v) { setWhenIso(''); return; } const local = new Date(v); setWhenIso(local.toISOString()); }}
           />
         </label>
 
@@ -770,48 +742,87 @@ function ReportPane({
           <div className="flex gap-2">
             <input
               className="flex-1 rounded-md border px-3 py-2"
-              placeholder='e.g. "Post Office, Glen Cove, NY"'
+              placeholder='Business or address (e.g. "Starbucks, Glen Cove NY" or "81 Forest Ave, Glen Cove")'
               value={addressText}
               onChange={(e) => setAddressText(e.target.value)}
             />
-            <button className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50" onClick={onFindAddress}>
-              Find Address
+            <button
+              className={`rounded-md border px-3 py-2 text-sm ${isGeocoding ? 'bg-gray-200 opacity-70' : 'hover:bg-gray-50'}`}
+              disabled={isGeocoding}
+              onClick={onFindAddress}
+            >
+              {isGeocoding ? 'Finding…' : 'Find Address'}
             </button>
           </div>
-          {!!(lat && lng) && (
+
             <p className="text-xs text-gray-500 mt-1">
-              Pinned: {lat.toFixed(5)}, {lng.toFixed(5)}
-            </p>
+    Tip: If a business isn’t found, try its full street address. Only precise matches will drop a pin.
+  </p>
+{altChoices.length > 0 && (
+    <div className="mt-2 rounded-lg border">
+      <div className="px-3 py-2 text-xs text-gray-500">Choose a match</div>
+      <ul className="max-h-56 overflow-auto divide-y">
+        {altChoices.map((c, i) => (
+          <li key={`${c.label}-${i}`} className="flex items-center justify-between gap-2 px-3 py-2">
+            <div className="min-w-0">
+              <div className="text-sm truncate">{c.label}</div>
+              <div className="text-[11px] text-gray-500">source: {c.provider}</div>
+            </div>
+            <button
+              className="shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-gray-50"
+              onClick={() => {
+                setLat(c.lat);
+                setLng(c.lng);
+                setAddressText(c.label);
+                setAltChoices([]);
+                setActiveTab('map');
+                setCenterReq((v) => v + 1);
+                setTimeout(() => setCenterReq((v) => v + 1), 140);
+              }}
+            >
+              Use
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )}
+          {lat != null && lng != null && (
+            <p className="text-xs text-gray-500 mt-1">Pinned: {lat.toFixed(5)}, {lng.toFixed(5)}</p>
           )}
         </label>
 
         <label className="flex flex-col gap-1 md:col-span-2">
           <span className="text-sm">Photos / Video (adding files will append)</span>
           <div className="flex items-center gap-2">
-            <label className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm cursor-pointer hover:bg-gray-50">
+            <label className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm cursor-pointer hover:bg-gray-50 active:bg-gray-200 select-none">
               <input
                 ref={fileInputRef}
                 type="file"
                 accept="image/*,video/*"
                 multiple
                 hidden
-                onChange={(e) => {
-                  const files = e.currentTarget.files ? Array.from(e.currentTarget.files) : [];
-                  setMediaFiles(files);
-                }}
+                onChange={(e) => { const files = e.currentTarget.files ? Array.from(e.currentTarget.files) : []; setMediaFiles(files); }}
               />
               Choose files…
             </label>
-            {mediaFiles.length > 0 && (
-              <span className="text-xs text-gray-600">{mediaFiles.length} selected</span>
-            )}
+            {mediaFiles.length > 0 && <span className="text-xs text-gray-600">{mediaFiles.length} selected</span>}
           </div>
+        </label>
+
+        <label className="md:col-span-2 flex items-center gap-2">
+          <input type="checkbox" className="h-4 w-4" checked={reportAnon} onChange={(e) => setReportAnon(e.target.checked)} />
+          <span className="text-sm">Report anonymously</span>
         </label>
       </div>
 
       <div className="flex gap-2">
-        <button className="rounded-md border px-4 py-2" onClick={onSave}>
-          {isEditing ? 'Update sighting' : 'Save sighting'}
+        <button
+          className={`rounded-md border px-4 py-2 ${isSaving ? 'bg-gray-200 opacity-70' : 'hover:bg-gray-50'}`}
+          disabled={isSaving}
+          onClick={onSave}
+        >
+          {isSaving ? (isEditing ? 'Updating…' : 'Saving…') : (isEditing ? 'Update sighting' : 'Save sighting')}
         </button>
         <button className="rounded-md border px-4 py-2 text-gray-700" onClick={onClear}>Clear</button>
       </div>
@@ -823,8 +834,22 @@ function ReportPane({
 // Component: ClientPage
 // ==================
 export default function ClientPage() {
-  // Tabs
-  const [activeTab, setActiveTab] = useState<'map' | 'list' | 'report' | 'settings'>('map');
+
+  // Tabs — don't read localStorage during render (causes SSR mismatch)
+const [activeTab, setActiveTab] =
+  useState<'map' | 'list' | 'report' | 'settings'>('map');
+
+// Load saved tab AFTER mount
+useEffect(() => {
+  const saved = storage.get(STORAGE_TAB);
+  if (saved && ['map', 'list', 'report', 'settings'].includes(saved)) {
+    setActiveTab(saved as any);
+  }
+}, []);
+
+// Persist tab whenever it changes
+useEffect(() => { storage.set(STORAGE_TAB, activeTab); }, [activeTab]);
+
 
   // Session/user
   const [sessionEmail, setSessionEmail] = useState<string | null>(null);
@@ -832,7 +857,7 @@ export default function ClientPage() {
   // Room
   const [roomId, setRoomId] = useState<string | null>(null);
   const [roomName, setRoomName] = useState<string | null>(null);
-  const [requireAuth, setRequireAuth] = useState<boolean>(false);
+  const [requireAuth, setRequireAuth] = useState<boolean>(true); // default ON per your request
 
   // Default room toggle
   const [isDefaultRoom, setIsDefaultRoom] = useState<boolean>(false);
@@ -841,6 +866,7 @@ export default function ClientPage() {
   const [sightings, setSightings] = useState<Sighting[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   // Report form state
   const [summary, setSummary] = useState('');
@@ -851,7 +877,17 @@ export default function ClientPage() {
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
   const [mediaFiles, setMediaFiles] = useState<File[]>([]);
+  const [reportAnon, setReportAnon] = useState<boolean>(false);
+  const [isGeocoding, setIsGeocoding] = useState(false);
+  const [altChoices, setAltChoices] = useState<Array<{label:string; lat:number; lng:number; provider:string}>>([]);
+  const [isSaving, setIsSaving] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // NEW: explicit center trigger for MapPane
+  const [centerReq, setCenterReq] = useState(0);
+  // Hydration guard: render only after we mount on the client
+const [mounted, setMounted] = useState(false);
+useEffect(() => { setMounted(true); }, []);
 
   // Edit state
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -859,17 +895,9 @@ export default function ClientPage() {
 
   // Use a stable vh unit on mobile (handles iOS/Chrome URL bar collapse/expand)
   useEffect(() => {
-    const setVH = () => {
-      const vh = window.innerHeight * 0.01;
-      document.documentElement.style.setProperty('--app-vh', `${vh}px`);
-    };
-    setVH();
-    window.addEventListener('resize', setVH);
-    window.addEventListener('orientationchange', setVH);
-    return () => {
-      window.removeEventListener('resize', setVH);
-      window.removeEventListener('orientationchange', setVH);
-    };
+    const setVH = () => { const vh = window.innerHeight * 0.01; document.documentElement.style.setProperty('--app-vh', `${vh}px`); };
+    setVH(); window.addEventListener('resize', setVH); window.addEventListener('orientationchange', setVH);
+    return () => { window.removeEventListener('resize', setVH); window.removeEventListener('orientationchange', setVH); };
   }, []);
 
   // Prompt to refresh if a new service worker (new version) is available
@@ -902,26 +930,17 @@ export default function ClientPage() {
   }, []);
 
   // Default the report time to "now" (local) on first load
-  useEffect(() => {
-    if (!whenIso) setWhenIso(new Date().toISOString());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useEffect(() => { if (!whenIso) setWhenIso(new Date().toISOString()); /* eslint-disable-next-line */ }, []);
 
   // Load session/email
   useEffect(() => {
     let mounted = true;
     (async () => {
       const { data } = await supabase.auth.getUser();
-      if (!mounted) return;
-      setSessionEmail(data.user?.email ?? null);
+      if (!mounted) return; setSessionEmail(data.user?.email ?? null);
     })();
-    const sub = supabase.auth.onAuthStateChange((_e, sess) => {
-      setSessionEmail(sess?.user?.email ?? null);
-    });
-    return () => {
-      mounted = false;
-      sub.data.subscription.unsubscribe();
-    };
+    const sub = supabase.auth.onAuthStateChange((_e, sess) => { setSessionEmail(sess?.user?.email ?? null); });
+    return () => { mounted = false; sub.data.subscription.unsubscribe(); };
   }, []);
 
   // Deep-link & default/last room auto-selection
@@ -943,24 +962,17 @@ export default function ClientPage() {
       storage.set(STORAGE_LAST, roomId);
       const curDefault = storage.get<string>(STORAGE_DEFAULT);
       setIsDefaultRoom(!!roomId && curDefault === roomId);
-    } else {
-      setIsDefaultRoom(false);
-    }
+    } else setIsDefaultRoom(false);
   }, [roomId]);
 
   function toggleDefaultRoom() {
     if (!roomId) return;
     const cur = storage.get<string>(STORAGE_DEFAULT);
-    if (cur === roomId) {
-      storage.remove(STORAGE_DEFAULT);
-      setIsDefaultRoom(false);
-    } else {
-      storage.set(STORAGE_DEFAULT, roomId);
-      setIsDefaultRoom(true);
-    }
+    if (cur === roomId) { storage.remove(STORAGE_DEFAULT); setIsDefaultRoom(false); }
+    else { storage.set(STORAGE_DEFAULT, roomId); setIsDefaultRoom(true); }
   }
 
-  // ---- Room helpers (UUID or short_code) ----
+  // ---- Room helpers (UUID, short_code, or name) ----
   async function joinRoomById(input: string) {
     const raw = (input || '').trim();
     if (!raw) return;
@@ -968,56 +980,128 @@ export default function ClientPage() {
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
     const short = raw.toLowerCase();
 
-    let data: { id: string; name: string | null } | null = null;
-    let error: any = null;
+    try {
+      // 1) UUID
+      if (isUuid) {
+        const { data, error } = await supabase
+          .from('rooms')
+          .select('id, name')
+          .eq('id', raw)
+          .maybeSingle();
+        if (error) return alert(`Join failed: ${error.message}`);
+        if (!data) return alert('Room not found.');
+        setRoomId(data.id); setRoomName(data.name || null); setSelectedId(null);
+        await loadSightings(data.id);
+        return;
+      }
 
-    if (isUuid) {
-      ({ data, error } = await supabase
-        .from('rooms')
-        .select('id, name')
-        .eq('id', raw)
-        .maybeSingle());
-    } else {
-      ({ data, error } = await supabase
-        .from('rooms')
-        .select('id, name')
-        .eq('short_code', short)
-        .maybeSingle());
+      // 2) Short code (exact)
+      {
+        const { data, error } = await supabase
+          .from('rooms')
+          .select('id, name, short_code')
+          .eq('short_code', short)
+          .maybeSingle();
+        if (error && error.code !== 'PGRST116') { // not "No rows"
+          return alert(`Join failed: ${error.message}`);
+        }
+        if (data) {
+          setRoomId(data.id); setRoomName(data.name || null); setSelectedId(null);
+          await loadSightings(data.id);
+          return;
+        }
+      }
+
+      // 3) Exact name (but don’t assume single row)
+      {
+        const { data, error } = await supabase
+          .from('rooms')
+          .select('id, name, short_code')
+          .eq('name', raw)
+          .limit(5);
+        if (error) return alert(`Join failed: ${error.message}`);
+        if (data && data.length === 1) {
+          const r = data[0];
+          setRoomId(r.id); setRoomName(r.name || null); setSelectedId(null);
+          await loadSightings(r.id);
+          return;
+        }
+        if (data && data.length > 1) {
+          const pick = prompt(
+            `Multiple rooms named "${raw}".\n` +
+            data.map((r, i) => `${i + 1}) ${r.name || '(no name)'} — short code: ${r.short_code || 'n/a'} — id: ${r.id}`).join('\n') +
+            `\n\nType a number (1-${data.length}), or paste a short code / id:`
+          );
+          if (!pick) return;
+          const idx = Number(pick);
+          if (Number.isInteger(idx) && idx >= 1 && idx <= data.length) {
+            const r = data[idx - 1];
+            setRoomId(r.id); setRoomName(r.name || null); setSelectedId(null);
+            await loadSightings(r.id);
+            return;
+          }
+          // user pasted something else (short code or id) — try again with that
+          return joinRoomById(pick.trim());
+        }
+      }
+
+      // 4) Fuzzy name (ILIKE)
+      {
+        const { data, error } = await supabase
+          .from('rooms')
+          .select('id, name, short_code')
+          .ilike('name', raw) // tries case-insensitive
+          .limit(5);
+        if (error) return alert(`Join failed: ${error.message}`);
+        if (data && data.length === 1) {
+          const r = data[0];
+          setRoomId(r.id); setRoomName(r.name || null); setSelectedId(null);
+          await loadSightings(r.id);
+          return;
+        }
+        if (data && data.length > 1) {
+          const pick = prompt(
+            `Found multiple rooms similar to "${raw}".\n` +
+            data.map((r, i) => `${i + 1}) ${r.name || '(no name)'} — short code: ${r.short_code || 'n/a'} — id: ${r.id}`).join('\n') +
+            `\n\nType a number (1-${data.length}), or paste a short code / id:`
+          );
+          if (!pick) return;
+          const idx = Number(pick);
+          if (Number.isInteger(idx) && idx >= 1 && idx <= data.length) {
+            const r = data[idx - 1];
+            setRoomId(r.id); setRoomName(r.name || null); setSelectedId(null);
+            await loadSightings(r.id);
+            return;
+          }
+          return joinRoomById(pick.trim());
+        }
+      }
+
+      // Not found
+      alert('Room not found. Try the room’s short code or ID.');
+    } catch (e: any) {
+      alert(`Join failed: ${e?.message || String(e)}`);
     }
-
-    if (error) return alert(`Join failed: ${error.message}`);
-    if (!data) return alert('Room not found.');
-
-    setRoomId(data.id);
-    setRoomName(data.name);
-    await loadSightings(data.id);
   }
 
   async function createRoom(r: { name?: string | null; owner_email?: string | null }) {
     const payload = {
       name: r.name || null,
       owner_email: r.owner_email || sessionEmail || null,
-      short_code:
-        (r.name || 'room').toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 10) +
-        '-' + Math.random().toString(36).slice(2, 6),
+      short_code: ((r.name || 'room').toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 10) + '-' + Math.random().toString(36).slice(2, 6)),
+      admin_code: randomAdminCode(),
     };
     const { data, error } = await supabase.from('rooms').insert(payload).select('id, name').single();
     if (error) return alert(`Create room failed: ${error.message}`);
-    setRoomId(data.id);
-    setRoomName(data.name);
+    setRoomId(data.id); setRoomName(data.name); setSelectedId(null);
     await loadSightings(data.id);
   }
-  function leaveRoom() {
-    setRoomId(null);
-    setRoomName(null);
-    setSightings([]);
-  }
+  function leaveRoom() { setRoomId(null); setRoomName(null); setSightings([]); setSelectedId(null); }
 
   // Sightings load / refresh
   async function loadSightings(id = roomId) {
     if (!id) return;
-    setLoading(true);
-    setErrorMsg(null);
+    setLoading(true); setErrorMsg(null);
     try {
       const { data, error } = await supabase
         .from('sightings')
@@ -1026,19 +1110,14 @@ export default function ClientPage() {
         .order('reported_at', { ascending: false });
       if (error) setErrorMsg(error.message);
       else setSightings((data || []) as Sighting[]);
-    } catch (e: any) {
-      setErrorMsg(e?.message || String(e));
-    } finally {
-      setLoading(false);
-    }
+    } catch (e: any) { setErrorMsg(e?.message || String(e)); }
+    finally { setLoading(false); }
   }
   useEffect(() => { if (roomId) void loadSightings(roomId); /* eslint-disable-next-line */ }, [roomId]);
 
   // Keep mobile in sync when returning to the tab/app
   useEffect(() => {
-    const onVis = () => {
-      if (document.visibilityState === 'visible' && roomId) void loadSightings(roomId);
-    };
+    const onVis = () => { if (document.visibilityState === 'visible' && roomId) void loadSightings(roomId); };
     document.addEventListener('visibilitychange', onVis);
     return () => document.removeEventListener('visibilitychange', onVis);
   }, [roomId]);
@@ -1049,9 +1128,7 @@ export default function ClientPage() {
     const urls: string[] = [];
     for (const f of files) {
       const key = buildStorageKey(room, f.name);
-      const { error } = await supabase.storage.from('sighting-photos').upload(key, f, {
-        cacheControl: '3600', upsert: false,
-      });
+      const { error } = await supabase.storage.from('sighting-photos').upload(key, f, { cacheControl: '3600', upsert: false });
       if (error) throw new Error(`Upload failed: ${error.message}`);
       const { data: pub } = supabase.storage.from('sighting-photos').getPublicUrl(key);
       if (pub?.publicUrl) urls.push(pub.publicUrl);
@@ -1076,16 +1153,18 @@ export default function ClientPage() {
       try {
         const q = [addressText, city, stateCode].filter(Boolean).join(', ');
         if (q) {
-          const g = await geocodeAddress(q);
+          setIsGeocoding(true);
+          const g = await geocodeAddress(q, roomId || undefined);
           if (g?.lat != null && g?.lng != null) {
             resolved = { address_text: g.address_text || q, lat: g.lat!, lng: g.lng! };
-            setAddressText(resolved.address_text || '');
-            setLat(resolved.lat!);
-            setLng(resolved.lng!);
+            setAddressText(resolved.address_text || ''); setLat(resolved.lat!); setLng(resolved.lng!);
           }
         }
       } catch {}
+      finally { setIsGeocoding(false); }
     }
+
+    const userName = reportAnon ? 'anonymous' : (sessionEmail || 'anonymous');
 
     // Base payload
     const base = {
@@ -1097,68 +1176,109 @@ export default function ClientPage() {
       lat: resolved.lat ?? null,
       lng: resolved.lng ?? null,
       reported_at: whenIso || new Date().toISOString(),
-      user_name: sessionEmail || 'anonymous',
+      user_name: userName,
       vehicle_make, vehicle_model, vehicle_color,
     };
 
-    if (!base.summary || !base.city || !base.state) {
-      return alert('City, State, and Summary are required.');
-    }
+    if (!base.summary || !base.city || !base.state) return alert('City, State, and Summary are required.');
+
+    // Require a precise pin before saving (prevents “no pin” reports)
+if (base.lat == null || base.lng == null) {
+  alert('Please double-tap the map or use “Find Address” to drop a pin first.');
+  setActiveTab('report'); // send user back to add a pin
+  return;
+}
+
 
     try {
+      setIsSaving(true);
       let finalMedia: string[] | null = editingId ? (editingOriginalMedia ? [...editingOriginalMedia] : null) : null;
 
-      // Upload new media (append if editing)
       if (mediaFiles.length) {
         const newUrls = await uploadFilesForRoom(roomId, mediaFiles);
         finalMedia = (finalMedia || []).concat(newUrls);
       }
 
       if (!editingId) {
-        // Insert new
-        const { error } = await supabase.from('sightings').insert({
-          ...base,
-          media_urls: finalMedia,
-        }).select('id').single();
-        if (error) return alert(`Upload failed: ${error.message}`);
+  // Return id + coords so we can jump to the pin
+  const { data: created, error } = await supabase
+    .from('sightings')
+    .insert({ ...base, media_urls: finalMedia })
+    .select('id, lat, lng')
+    .single();
 
-        // Ensure you’re a member so notify has a recipient
-        await ensureMember(roomId, sessionEmail || undefined);
+  if (error) return alert(`Upload failed: ${error.message}`);
 
-        // Notify (best-effort)
-        const { status: ns, json: nj } = await notifyRoom({
-          room_id: roomId,
-          title: base.summary.slice(0, 80) || 'New sighting',
-          notes: base.summary,
-          address_text: base.address_text,
-          lat: base.lat,
-          lng: base.lng,
-          when_iso: base.reported_at,
-        });
-        if (ns !== 200) alert(`Notify failed (${ns}).\n${JSON.stringify(nj, null, 2)}`);
-      } else {
-        // Update existing
-        const { error } = await supabase
-          .from('sightings')
-          .update({ ...base, media_urls: finalMedia })
-          .eq('id', editingId);
-        if (error) return alert(`Update failed: ${error.message}`);
-      }
+  await ensureMember(roomId, sessionEmail || undefined);
 
-      await loadSightings(roomId);
-      clearReportForm();
-      setActiveTab('list');
+  const { status: ns, json: nj } = await notifyRoom({
+    room_id: roomId,
+    title: base.summary.slice(0, 80) || 'New sighting',
+    notes: base.summary,
+    address_text: base.address_text,
+    lat: base.lat,
+    lng: base.lng,
+    when_iso: base.reported_at,
+  });
+  if (ns !== 200) alert(`Notify failed (${ns}).\n${JSON.stringify(nj, null, 2)}`);
+
+  // If the DB has lat/lng, jump straight to the Map and center there
+  if (created) {
+    setSelectedId(created.id);
+    if (created.lat != null && created.lng != null) {
+      setLat(created.lat);
+      setLng(created.lng);
+      setActiveTab('map');          // show the map
+      setCenterReq((c) => c + 1);   // force center to this pin
+    } else {
+      setActiveTab('list');         // fallback if no coords
+    }
+  }
+} else {
+  const { data: updated, error } = await supabase
+    .from('sightings')
+    .update({ ...base, media_urls: finalMedia })
+    .eq('id', editingId)
+    .select('id, lat, lng')
+    .single();
+  if (error) return alert(`Update failed: ${error.message}`);
+
+  // Show the map and center on the edited pin (if it has coords)
+  if (updated) {
+    setSelectedId(updated.id);
+    if (updated.lat != null && updated.lng != null) {
+      setLat(updated.lat);
+      setLng(updated.lng);
+      setActiveTab('map');
+      setCenterReq((c) => c + 1);
+    }
+  }
+}
+
+     await loadSightings(roomId);
+clearReportForm();
+// do not force tab here; creation branch already switched to map if it had coords
     } catch (e: any) {
       alert(`Save failed: ${e?.message || String(e)}`);
+    } finally {
+      setIsSaving(false);
     }
   }
 
   function clearReportForm() {
-    setSummary(''); setCity(''); setStateCode(''); setAddressText('');
-    setLat(null); setLng(null); setWhenIso('');
-    setMediaFiles([]); if (fileInputRef.current) fileInputRef.current.value = '';
-    setEditingId(null); setEditingOriginalMedia(null);
-  }
+  setEditingId(null);
+  setSummary('');
+  setCity('');
+  setStateCode('');
+  setAddressText('');
+  setWhenIso(new Date().toISOString());  // ⬅️ default to “now” immediately
+  setLat(null);
+  setLng(null);
+  setMediaFiles([]);
+  setReportAnon(false);
+  // If you added the candidates picker:
+  try { setAltChoices([]); } catch {}
+}
 
   async function handleDelete(s: Sighting) {
     if (!roomId) return;
@@ -1176,20 +1296,39 @@ export default function ClientPage() {
     setCity(s.city || '');
     setStateCode(s.state || '');
     setAddressText(s.address_text || '');
-    setLat(s.lat ?? null);
-    setLng(s.lng ?? null);
+    setLat(s.lat ?? null); setLng(s.lng ?? null);
     setWhenIso(s.reported_at || new Date().toISOString());
     setActiveTab('report');
     (globalThis as any).__ufoVehicle = {
-      vehicleMake: s.vehicle_make || '',
-      vehicleModel: s.vehicle_model || '',
-      vehicleColor: s.vehicle_color || '',
+      vehicleMake: s.vehicle_make || '', vehicleModel: s.vehicle_model || '', vehicleColor: s.vehicle_color || '',
     };
+  }
+
+  // ---- Simple email/password auth UI (sign up & sign in) ----
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPass, setAuthPass] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  async function doSignUp() {
+    if (!authEmail || !authPass) return alert('Enter email and password');
+    setAuthBusy(true);
+    const { error } = await supabase.auth.signUp({ email: authEmail, password: authPass });
+    setAuthBusy(false);
+    alert(error ? `Sign-up error: ${error.message}` : 'Account created. You are signed in.');
+  }
+  async function doSignIn() {
+    if (!authEmail || !authPass) return alert('Enter email and password');
+    setAuthBusy(true);
+    const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPass });
+    setAuthBusy(false);
+    alert(error ? `Sign-in error: ${error.message}` : 'Signed in.');
   }
 
   // ===========
   // Page header
   // ===========
+  const gated = requireAuth && !sessionEmail;
+
+  if (!mounted) return null;
   return (
     <main className="mx-auto max-w-5xl p-4 space-y-4">
       <header className="flex items-center justify-between">
@@ -1203,17 +1342,27 @@ export default function ClientPage() {
           <div className="text-sm text-gray-700">{sessionEmail ? sessionEmail : 'Signed out'}</div>
           <div className="mt-1 flex gap-2 justify-end">
             {!sessionEmail ? (
-              <button
-                className="rounded-md border px-3 py-1 text-sm"
-                onClick={async () => {
-                  const email = prompt('Enter email to magic-link sign in'); if (!email) return;
-                  const { error } = await supabase.auth.signInWithOtp({
-                    email,
-                    options: { shouldCreateUser: true, emailRedirectTo: `${getBaseUrl()}/` },
-                  });
-                  alert(error ? `Sign-in error: ${error.message}` : 'Check your email for the magic link!');
-                }}
-              >Sign in</button>
+              <>
+                <input
+                  className="rounded-md border px-2 py-1 text-sm"
+                  placeholder="email"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                />
+                <input
+                  className="rounded-md border px-2 py-1 text-sm"
+                  placeholder="password"
+                  type="password"
+                  value={authPass}
+                  onChange={(e) => setAuthPass(e.target.value)}
+                />
+                <button className={`rounded-md border px-3 py-1 text-sm ${authBusy ? 'opacity-70' : ''}`} disabled={authBusy} onClick={doSignUp}>
+                  {authBusy ? 'Working…' : 'Sign up'}
+                </button>
+                <button className={`rounded-md border px-3 py-1 text-sm ${authBusy ? 'opacity-70' : ''}`} disabled={authBusy} onClick={doSignIn}>
+                  {authBusy ? 'Working…' : 'Sign in'}
+                </button>
+              </>
             ) : (
               <button className="rounded-md border px-3 py-1 text-sm" onClick={async () => { await supabase.auth.signOut(); }}>
                 Sign out
@@ -1234,20 +1383,31 @@ export default function ClientPage() {
         ))}
       </nav>
 
+      {/* Gate posting if required */}
+      {gated && (
+        <div className="rounded-xl border p-4 bg-yellow-50 text-sm">
+          Posting is restricted. Please sign in above to report sightings or create rooms.
+        </div>
+      )}
+
       {/* Panels */}
       {activeTab === 'map' && (
         <MapPane
           roomId={roomId || 'none'}
           points={sightings}
-          selectedId={null}
+          selectedId={selectedId}
           draft={{ lat: lat ?? null, lon: lng ?? null }}
-          onSelect={() => setActiveTab('list')}
+          onSelect={(id) => { setSelectedId(id); setActiveTab('list'); }}
           onMapClick={async (clat, clon) => {
             setLat(clat); setLng(clon);
-            try { const g = await geocodeAddress(`${clat}, ${clon}`); if (g?.address_text) setAddressText(g.address_text); } catch {}
+            try {
+              const g = await geocodeAddress(`${clat}, ${clon}`, roomId || undefined);
+              if (g?.address_text) setAddressText(g.address_text);
+            } catch {}
             setActiveTab('report');
           }}
           isVisible={activeTab === 'map'}
+          centerReq={centerReq} // NEW
         />
       )}
 
@@ -1257,8 +1417,9 @@ export default function ClientPage() {
           loading={loading}
           errorMsg={errorMsg}
           onRefresh={() => loadSightings()}
-          onEdit={beginEdit}
+          onEdit={(s) => beginEdit(s)}
           onDelete={handleDelete}
+          onViewOnMap={(s) => { setSelectedId(s.id); setActiveTab('map'); }}
         />
       )}
 
@@ -1275,19 +1436,89 @@ export default function ClientPage() {
           lng={lng} setLng={setLng}
           mediaFiles={mediaFiles} setMediaFiles={setMediaFiles}
           fileInputRef={fileInputRef}
-          onFindAddress={async () => {
-            const q = [addressText, city, stateCode].filter(Boolean).join(', ');
-            if (!q) return;
-            try {
-              const g = await geocodeAddress(q);
-              if (g?.lat != null && g?.lng != null) {
-                setLat(g.lat); setLng(g.lng); setAddressText(g.address_text || q);
-                setActiveTab('map');
-              } else { alert('No match found.'); }
-            } catch (e: any) { alert(`Geocode failed: ${e?.message || e}`); }
-          }}
+   onFindAddress={async () => {
+  const q = [addressText, city, stateCode].filter(Boolean).join(', ');
+  if (!q) return;
+
+  // Show Map first so Leaflet is mounted when the result arrives
+  setActiveTab('map');
+
+  try {
+    setIsGeocoding(true);
+
+    // Optional bias near last map view for this room
+    const saved = roomId ? storage.get<{ lat:number; lon:number; zoom:number } | null>(`ufo:mapstate:${roomId}`, null) : null;
+    const near = saved ? { lat: saved.lat, lng: saved.lon } : null;
+
+    // 1) Strict search (requires city/state match)
+    const res = await fetch('/api/geocode', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        q,
+        near,
+        expectCity: city,
+        expectState: stateCode,
+      }),
+    });
+
+    if (!res.ok) {
+      // 2) If strict fails, fetch candidates for a picker
+      const cr = await fetch('/api/geocode', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ q, near, candidates: true }),
+      });
+      if (cr.ok) {
+        const { candidates } = await cr.json();
+        setAltChoices(
+          (candidates || []).slice(0, 8).map((c: any) => ({
+            label: c.label,
+            lat: Number(c.lat),
+            lng: Number(c.lng),
+            provider: c.provider,
+          }))
+        );
+      } else {
+        alert('No precise match found in the specified city/state.');
+      }
+      return;
+    }
+
+    const g = await res.json();
+
+    // Coerce to numbers
+    const latNum = g?.lat != null ? Number(g.lat) : null;
+    const lngNum = g?.lng != null ? Number(g.lng) : null;
+
+    if (latNum != null && Number.isFinite(latNum) && lngNum != null && Number.isFinite(lngNum)) {
+      setAltChoices([]); // clear any prior candidates
+      setLat(latNum);
+      setLng(lngNum);
+      setAddressText(g.address_text || q);
+
+      // Center now and after paint (mobile-safe)
+      setCenterReq((c) => c + 1);
+      setTimeout(() => setCenterReq((c) => c + 1), 140);
+      setTimeout(() => setCenterReq((c) => c + 1), 380);
+    } else {
+      alert('No precise match found.');
+    }
+  } catch (e: any) {
+    alert(`Geocode failed: ${e?.message || e}`);
+  } finally {
+    setIsGeocoding(false);
+  }
+}
+}
           onSave={upsertSighting}
           onClear={clearReportForm}
+          reportAnon={reportAnon} setReportAnon={setReportAnon}
+          isGeocoding={isGeocoding} isSaving={isSaving}
+            altChoices={altChoices}
+  setAltChoices={setAltChoices}
+  setActiveTab={setActiveTab}
+  setCenterReq={setCenterReq}
         />
       )}
 
@@ -1328,8 +1559,7 @@ export default function ClientPage() {
               .select('email, phone_e164, approved, email_enabled, sms_enabled')
               .eq('room_id', roomId)
               .eq('approved', true);
-            alert(error ? `Members query error: ${error.message}` :
-              `Approved members:\n${JSON.stringify(data, null, 2)}`);
+            alert(error ? `Members query error: ${error.message}` : `Approved members:\n${JSON.stringify(data, null, 2)}`);
           }}
         />
       )}
